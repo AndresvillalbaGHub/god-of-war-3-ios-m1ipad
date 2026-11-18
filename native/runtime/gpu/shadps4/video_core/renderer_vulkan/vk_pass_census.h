@@ -84,6 +84,11 @@ struct State {
     bool feedback_loop{};
     std::pair<std::uint32_t, std::uint32_t> area{};       ///< render area
     std::pair<std::uint32_t, std::uint32_t> depth_size{}; ///< the depth image, 0x0 without one
+    std::vector<std::uint8_t> color_clears;               ///< 1 if CB meta-cleared (eClear), else 0 (eLoad)
+    std::vector<std::uint8_t> color_blends;               ///< 1 if blend enabled on CB, else 0
+    std::vector<std::uint8_t> color_masks;                ///< 4-bit RGBA write mask per CB (0xF = full)
+    bool depth_readonly{};                                ///< true if depth attachment layout is read-only
+    std::uint8_t attachment_loads{};                      ///< attachments opening with eLoad in this pass
 };
 
 inline std::string Format(const State& s) {
@@ -107,6 +112,27 @@ inline std::string Format(const State& s) {
     if (s.depth_size.first && s.depth_size != s.area) {
         out += " (depth " + std::to_string(s.depth_size.first) + 'x' +
                std::to_string(s.depth_size.second) + ')';
+    }
+    out += " | loads " + std::to_string(s.attachment_loads);
+    if (!s.color_clears.empty()) {
+        out += " cb(";
+        for (std::size_t i = 0; i < s.color_clears.size(); ++i) {
+            if (i) {
+                out += ',';
+            }
+            out += s.color_clears[i] ? 'C' : 'L';
+            out += (i < s.color_blends.size() && s.color_blends[i]) ? 'b' : '-';
+            if (i < s.color_masks.size()) {
+                constexpr char hex[] = "0123456789abcdef";
+                out += hex[s.color_masks[i] & 0xFu];
+            }
+        }
+        out += ')';
+    }
+    if (s.depth_samples) {
+        out += std::string(" db(") + (s.depth_clear != DepthClear::None ? 'C' : 'L') +
+               (s.depth_readonly ? 'r' : 'w') + (s.stencil_clear ? 'C' : 'L') +
+               (s.stencil_write ? 'w' : 'r') + ')';
     }
     return out;
 }

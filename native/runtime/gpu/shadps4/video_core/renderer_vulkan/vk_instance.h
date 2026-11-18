@@ -243,6 +243,11 @@ public:
         return amd_shader_trinary_minmax;
     }
 
+    /// Returns true when VK_KHR_load_store_op_none is supported.
+    bool IsLoadStoreOpNoneSupported() const {
+        return load_store_op_none;
+    }
+
     /// Returns true when the shaderBufferFloat32AtomicMinMax feature of
     /// VK_EXT_shader_atomic_float2 is supported.
     bool IsShaderAtomicFloatBuffer32MinMaxSupported() const {
@@ -613,6 +618,7 @@ private:
     bool pipeline_binaries{};
     vk::PipelineBinaryKeyKHR pipeline_binary_global_key{};
     bool maintenance_8{};
+    bool load_store_op_none{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};

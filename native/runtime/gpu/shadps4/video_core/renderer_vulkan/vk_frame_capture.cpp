@@ -127,10 +127,18 @@ void Write(VAddr presented) {
     }
     std::fprintf(f, "presented buffer %#llx\n", static_cast<unsigned long long>(presented));
     u32 index = 0;
+    u32 render_passes = 0;
+    u32 compute_passes = 0;
+    u64 total_draws = 0;
+    u64 total_indices = 0;
     for (const auto& e : entries) {
+        total_draws += e.draws;
         if (e.compute) {
+            ++compute_passes;
             std::fprintf(f, "\n#%u COMPUTE dispatches %u, cs", index++, e.draws);
         } else {
+            ++render_passes;
+            total_indices += e.indices;
             std::fprintf(f, "\n#%u PASS draws %u (indices %llu), vs/ps", index++, e.draws,
                          static_cast<unsigned long long>(e.indices));
         }
@@ -157,6 +165,9 @@ void Write(VAddr presented) {
             std::fprintf(f, "%s\n", b.c_str());
         }
     }
+    std::fprintf(f, "\n# summary: %u render passes, %u compute dispatches, %llu draws, %llu indices\n",
+                 render_passes, compute_passes, static_cast<unsigned long long>(total_draws),
+                 static_cast<unsigned long long>(total_indices));
     std::fclose(f);
     std::printf("Frame capture: %zu passes written to %s\n", entries.size(), path.c_str());
     SetResult(std::format("Frame captured ({} passes): {}", entries.size(), path));

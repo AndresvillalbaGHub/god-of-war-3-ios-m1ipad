@@ -43,6 +43,22 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+/// Counts attachments in `state` that open with eLoad (color targets + depth/stencil).
+static u32 CountAttachmentLoads(const RenderState& state) {
+    u32 loads = 0;
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        const auto& ca = state.color_attachments[cb];
+        if (ca.image_view && !ca.is_clear) {
+            ++loads;
+        }
+    }
+    const auto& ds = state.depth_stencil_attachment;
+    if ((ds.has_depth && !ds.depth_clear) || (ds.has_stencil && !ds.stencil_clear)) {
+        ++loads;
+    }
+    return loads;
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
@@ -2962,6 +2978,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                      : PassCensus::DepthClear::Register;
             census.depth_layout = vk::to_string(new_layout);
             census.depth_size = {image.info.size.width, image.info.size.height};
+            census.depth_readonly = !desc.view_info.is_storage;
         }
         if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout,
                                          vk::PipelineStageFlagBits2::eEarlyFragmentTests |
@@ -3102,8 +3119,16 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             if (cb_descs[cb].first) {
                 colors[cb] = &texture_cache.GetImage(cb_descs[cb].first).info;
                 census.color_samples.push_back(u8(regs.color_buffers[cb].NumSamples()));
+                const bool cleared = state.color_attachments[cb].is_clear != 0;
+                const bool blended =
+                    regs.blend_control[cb].enable && !regs.color_buffers[cb].info.blend_bypass;
+                const u8 mask = u8(regs.color_target_mask.GetMask(cb) & 0xFu);
+                census.color_clears.push_back(cleared ? 1 : 0);
+                census.color_blends.push_back(blended ? 1 : 0);
+                census.color_masks.push_back(mask);
             }
         }
+        census.attachment_loads = static_cast<u8>(CountAttachmentLoads(state));
         const auto* depth =
             db_desc.first ? &texture_cache.GetImage(db_desc.first).info : nullptr;
         census.raster_samples = u8(key.num_samples);
@@ -3766,6 +3791,8 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                             ? u64(texture_cache.GetImage(cb_descs[cb].first).info.pixel_format) + 1
                             : 0;
     }
+    const u32 loads = CountAttachmentLoads(state);
+    parts[12] = loads;
     const u64 key = XXH3_64bits(parts.data(), sizeof(parts));
     profiler->Mark(key, [&] {
         std::string targets;
@@ -3775,12 +3802,12 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                            : std::string{"-"};
             targets += ' ';
         }
-        return fmt::format("pass {}x{} [{}] depth {} vs {:016x} ps {:016x}", state.width,
+        return fmt::format("pass {}x{} [{}] depth {} loads={} vs {:016x} ps {:016x}", state.width,
                            state.height, targets,
                            db_desc.first ? vk::to_string(
                                                texture_cache.GetImage(db_desc.first).info.pixel_format)
                                          : std::string{"-"},
-                           vs.pgm_hash, ps ? ps->pgm_hash : 0);
+                           loads, vs.pgm_hash, ps ? ps->pgm_hash : 0);
     });
     profiler->CountDraw(vertices);
 }

@@ -204,6 +204,10 @@ public class Gow3CoreModule: Module {
     // MoltenVK binds descriptor sets directly, not through Metal argument buffers: every resource read
     // of every shader got cheaper. Same scenes on 0.1.45: 28 -> 40 FPS light, 25 -> 29 medium, 20.5 -> 26 heavy.
     setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0)
+    // Push descriptors on for game pipelines: disabling them on MoltenVK 1.4.1+ (0.1.27) cost ~half
+    // the FPS (4-12 vs ~27) and was not the texture corruption cause (that was GOW3_READBACK_LINEAR).
+    // Renderer host passes (detiler/blits) keep descriptor sets by default (GOW3_HOST_PUSH_DESCRIPTORS=0).
+    setenv("GOW3_PUSH_DESCRIPTORS", "1", 0)
     // FEX without x86 memory-ordering (TSO) emulation, as the Android port runs this game
     // (android/runtime/fex-config.json): cheaper loads and stores in the translated code. It crashed
     // on 0.1.35, which was the x18 bug (fixed in 0.1.45); on 0.1.45 the worst-frame p90 fell 83 -> 54 ms.
