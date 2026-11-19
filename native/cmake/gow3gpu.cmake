@@ -84,7 +84,8 @@ add_library(gow3gpu STATIC
     "${GOW3_GPU}/third_party/imgui/backends/imgui_impl_vulkan.cpp"
     "${GOW3_GPU}/ios/ffx_stub.c"
     "${GOW3_GPU}/ios/avplayer_stub.cpp"
-    "${GOW3_GPU}/ios/metalfx_pass_ios.mm"
+    "${GOW3_GPU}/ios/metalfx_pass_ios.cpp"
+    "${GOW3_GPU}/ios/metalfx_bridge_ios.mm"
     "${GOW3_GPU}/ios/window_ios.mm")
 add_dependencies(gow3gpu gow3gpu_host_shaders)
 set_target_properties(gow3gpu PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)

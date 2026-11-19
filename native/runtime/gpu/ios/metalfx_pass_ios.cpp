@@ -2,11 +2,11 @@
 // gow3 (M1): Native iOS MetalFX Spatial upscaling pass bridged via VK_EXT_metal_objects.
 
 #define VK_USE_PLATFORM_METAL_EXT
-#import <Metal/Metal.h>
-#import <MetalFX/MetalFX.h>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -18,6 +18,16 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan_metal.h>
+
+namespace Vulkan::HostPasses::MetalFXBridge {
+void* RetainObject(void* raw);
+void ReleaseObject(void* retained);
+bool SupportsDevice(void* mtl_device, char* name_buf, std::size_t name_size);
+void* CreateScaler(void* mtl_device, std::uint32_t in_w, std::uint32_t in_h,
+                   std::uint32_t out_w, std::uint32_t out_h, bool perceptual_srgb);
+bool Encode(void* mtl_queue, void* scaler_ptr, void* src_tex, void* dst_tex,
+            std::uint32_t in_w, std::uint32_t in_h);
+} // namespace Vulkan::HostPasses::MetalFXBridge
 
 namespace Vulkan::HostPasses {
 
@@ -52,8 +62,7 @@ bool CreateExportableImage(VmaAllocator allocator, u32 width, u32 height, VkImag
            VK_SUCCESS;
 }
 
-id<MTLTexture> ExportTexture(VkDevice device, PFN_vkExportMetalObjectsEXT export_fn,
-                             VkImage image) {
+void* ExportTexture(VkDevice device, PFN_vkExportMetalObjectsEXT export_fn, VkImage image) {
     VkExportMetalTextureInfoEXT tex_info{
         .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
         .pNext = nullptr,
@@ -61,7 +70,7 @@ id<MTLTexture> ExportTexture(VkDevice device, PFN_vkExportMetalObjectsEXT export
         .imageView = VK_NULL_HANDLE,
         .bufferView = VK_NULL_HANDLE,
         .plane = VK_IMAGE_ASPECT_COLOR_BIT,
-        .mtlTexture = nil,
+        .mtlTexture = nullptr,
     };
     VkExportMetalObjectsInfoEXT objs_info{
         .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
@@ -93,11 +102,11 @@ struct MetalFXSpatialPass::Impl {
     struct Slot {
         vk::Image src_image{};
         VmaAllocation src_alloc{};
-        id<MTLTexture> src_mtl = nil;
+        void* src_mtl = nullptr;
 
         vk::Image dst_image{};
         VmaAllocation dst_alloc{};
-        id<MTLTexture> dst_mtl = nil;
+        void* dst_mtl = nullptr;
         vk::ImageView dst_view_srgb{};
         vk::ImageView dst_view_unorm{};
         vk::ImageLayout dst_layout = vk::ImageLayout::eUndefined;
@@ -107,9 +116,9 @@ struct MetalFXSpatialPass::Impl {
     VmaAllocator allocator{};
     PFN_vkExportMetalObjectsEXT export_fn{};
 
-    id<MTLDevice> mtl_device = nil;
-    id<MTLCommandQueue> mtl_queue = nil;
-    id<MTLFXSpatialScaler> scaler = nil;
+    void* mtl_device = nullptr;
+    void* mtl_queue = nullptr;
+    void* scaler = nullptr;
 
     u32 num_images = 0;
     u32 cur_slot = 0;
@@ -124,22 +133,24 @@ struct MetalFXSpatialPass::Impl {
         for (auto& s : slots) {
             if (s.dst_view_srgb) {
                 vk_device.destroyImageView(s.dst_view_srgb);
-                s.dst_view_srgb = nullptr;
+                s.dst_view_srgb = {};
             }
             if (s.dst_view_unorm) {
                 vk_device.destroyImageView(s.dst_view_unorm);
-                s.dst_view_unorm = nullptr;
+                s.dst_view_unorm = {};
             }
-            s.src_mtl = nil;
-            s.dst_mtl = nil;
+            MetalFXBridge::ReleaseObject(s.src_mtl);
+            s.src_mtl = nullptr;
+            MetalFXBridge::ReleaseObject(s.dst_mtl);
+            s.dst_mtl = nullptr;
             if (s.src_image && allocator) {
                 vmaDestroyImage(allocator, static_cast<VkImage>(s.src_image), s.src_alloc);
-                s.src_image = nullptr;
+                s.src_image = {};
                 s.src_alloc = nullptr;
             }
             if (s.dst_image && allocator) {
                 vmaDestroyImage(allocator, static_cast<VkImage>(s.dst_image), s.dst_alloc);
-                s.dst_image = nullptr;
+                s.dst_image = {};
                 s.dst_alloc = nullptr;
             }
             s.dst_layout = vk::ImageLayout::eUndefined;
@@ -154,27 +165,16 @@ struct MetalFXSpatialPass::Impl {
             return true;
         }
         scheduler.Finish();
-        scaler = nil;
+        MetalFXBridge::ReleaseObject(scaler);
+        scaler = nullptr;
         DestroySlots();
 
-        @autoreleasepool {
-            MTLFXSpatialScalerDescriptor* desc = [[MTLFXSpatialScalerDescriptor alloc] init];
-            desc.inputWidth = in_sz.width;
-            desc.inputHeight = in_sz.height;
-            desc.outputWidth = out_sz.width;
-            desc.outputHeight = out_sz.height;
-            desc.colorTextureFormat = MTLPixelFormatRGBA8Unorm;
-            desc.outputTextureFormat = MTLPixelFormatRGBA8Unorm;
-            desc.colorProcessingMode = perceptual_srgb
-                                           ? MTLFXSpatialScalerColorProcessingModePerceptual
-                                           : MTLFXSpatialScalerColorProcessingModeLinear;
-            scaler = [desc newSpatialScalerWithDevice:mtl_device];
-            if (!scaler) {
-                std::printf("MetalFX Spatial: newSpatialScalerWithDevice returned nil (%ux%u -> "
-                            "%ux%u)\n",
-                            in_sz.width, in_sz.height, out_sz.width, out_sz.height);
-                return false;
-            }
+        scaler = MetalFXBridge::CreateScaler(mtl_device, in_sz.width, in_sz.height, out_sz.width,
+                                             out_sz.height, perceptual_srgb);
+        if (!scaler) {
+            std::printf("MetalFX Spatial: newSpatialScalerWithDevice returned nil (%ux%u -> %ux%u)\n",
+                        in_sz.width, in_sz.height, out_sz.width, out_sz.height);
+            return false;
         }
 
         const u32 count = std::max(1u, num_images);
@@ -192,17 +192,21 @@ struct MetalFXSpatialPass::Impl {
                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     dst_raw, s.dst_alloc)) {
                 DestroySlots();
-                scaler = nil;
+                MetalFXBridge::ReleaseObject(scaler);
+                scaler = nullptr;
                 return false;
             }
             s.src_image = vk::Image{src_raw};
             s.dst_image = vk::Image{dst_raw};
-            s.src_mtl = ExportTexture(static_cast<VkDevice>(vk_device), export_fn, src_raw);
-            s.dst_mtl = ExportTexture(static_cast<VkDevice>(vk_device), export_fn, dst_raw);
+            s.src_mtl = MetalFXBridge::RetainObject(
+                ExportTexture(static_cast<VkDevice>(vk_device), export_fn, src_raw));
+            s.dst_mtl = MetalFXBridge::RetainObject(
+                ExportTexture(static_cast<VkDevice>(vk_device), export_fn, dst_raw));
             if (!s.src_mtl || !s.dst_mtl) {
                 std::printf("MetalFX Spatial: failed exporting MTLTexture from VkImage\n");
                 DestroySlots();
-                scaler = nil;
+                MetalFXBridge::ReleaseObject(scaler);
+                scaler = nullptr;
                 return false;
             }
             s.dst_view_srgb = CreateColorView(vk_device, s.dst_image, vk::Format::eR8G8B8A8Srgb);
@@ -244,40 +248,45 @@ void MetalFXSpatialPass::Create(const Instance& instance, u32 num_images) {
         return;
     }
 
-    @autoreleasepool {
-        VkExportMetalCommandQueueInfoEXT queue_info{
-            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT,
-            .pNext = nullptr,
-            .queue = static_cast<VkQueue>(instance.GetGraphicsQueue()),
-            .mtlCommandQueue = nil,
-        };
-        VkExportMetalDeviceInfoEXT dev_info{
-            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
-            .pNext = &queue_info,
-            .mtlDevice = nil,
-        };
-        VkExportMetalObjectsInfoEXT objs_info{
-            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
-            .pNext = &dev_info,
-        };
-        impl->export_fn(dev, &objs_info);
-        impl->mtl_device = dev_info.mtlDevice;
-        impl->mtl_queue = queue_info.mtlCommandQueue;
-        if (!impl->mtl_device || !impl->mtl_queue) {
-            std::printf("MetalFX Spatial: could not export MTLDevice/MTLCommandQueue\n");
-            impl->mtl_device = nil;
-            impl->mtl_queue = nil;
-            return;
-        }
-        if (![MTLFXSpatialScalerDescriptor supportsDevice:impl->mtl_device]) {
-            std::printf("MetalFX Spatial: device does not support MTLFXSpatialScaler\n");
-            impl->mtl_device = nil;
-            impl->mtl_queue = nil;
-            return;
-        }
-        impl->available = true;
-        std::printf("MetalFX Spatial: enabled on %s\n", [[impl->mtl_device name] UTF8String]);
+    VkExportMetalCommandQueueInfoEXT queue_info{
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT,
+        .pNext = nullptr,
+        .queue = static_cast<VkQueue>(instance.GetGraphicsQueue()),
+        .mtlCommandQueue = nullptr,
+    };
+    VkExportMetalDeviceInfoEXT dev_info{
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
+        .pNext = &queue_info,
+        .mtlDevice = nullptr,
+    };
+    VkExportMetalObjectsInfoEXT objs_info{
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+        .pNext = &dev_info,
+    };
+    impl->export_fn(dev, &objs_info);
+    if (!dev_info.mtlDevice || !queue_info.mtlCommandQueue) {
+        std::printf("MetalFX Spatial: could not export MTLDevice/MTLCommandQueue\n");
+        return;
     }
+
+    char gpu_name[128] = "Apple GPU";
+    if (!MetalFXBridge::SupportsDevice(dev_info.mtlDevice, gpu_name, sizeof(gpu_name))) {
+        std::printf("MetalFX Spatial: device does not support MTLFXSpatialScaler\n");
+        return;
+    }
+
+    impl->mtl_device = MetalFXBridge::RetainObject(dev_info.mtlDevice);
+    impl->mtl_queue = MetalFXBridge::RetainObject(queue_info.mtlCommandQueue);
+    if (!impl->mtl_device || !impl->mtl_queue) {
+        MetalFXBridge::ReleaseObject(impl->mtl_queue);
+        MetalFXBridge::ReleaseObject(impl->mtl_device);
+        impl->mtl_queue = nullptr;
+        impl->mtl_device = nullptr;
+        return;
+    }
+
+    impl->available = true;
+    std::printf("MetalFX Spatial: enabled on %s\n", gpu_name);
 }
 
 void MetalFXSpatialPass::Destroy() {
@@ -285,11 +294,14 @@ void MetalFXSpatialPass::Destroy() {
         return;
     }
     impl->DestroySlots();
-    impl->scaler = nil;
-    impl->mtl_queue = nil;
-    impl->mtl_device = nil;
+    MetalFXBridge::ReleaseObject(impl->scaler);
+    impl->scaler = nullptr;
+    MetalFXBridge::ReleaseObject(impl->mtl_queue);
+    impl->mtl_queue = nullptr;
+    MetalFXBridge::ReleaseObject(impl->mtl_device);
+    impl->mtl_device = nullptr;
     impl->export_fn = nullptr;
-    impl->vk_device = nullptr;
+    impl->vk_device = {};
     impl->allocator = nullptr;
     impl->cur_in = {};
     impl->cur_out = {};
@@ -416,18 +428,10 @@ vk::ImageView MetalFXSpatialPass::Render(Scheduler& scheduler, vk::Image src_ima
     scheduler.Flush();
 
     bool encoded = false;
-    @autoreleasepool {
+    {
         std::scoped_lock lk{Scheduler::submit_mutex};
-        id<MTLCommandBuffer> mtl_cmd = [impl->mtl_queue commandBuffer];
-        if (mtl_cmd) {
-            impl->scaler.colorTexture = slot.src_mtl;
-            impl->scaler.outputTexture = slot.dst_mtl;
-            impl->scaler.inputContentWidth = input_size.width;
-            impl->scaler.inputContentHeight = input_size.height;
-            [impl->scaler encodeToCommandBuffer:mtl_cmd];
-            [mtl_cmd commit];
-            encoded = true;
-        }
+        encoded = MetalFXBridge::Encode(impl->mtl_queue, impl->scaler, slot.src_mtl, slot.dst_mtl,
+                                        input_size.width, input_size.height);
     }
 
     if (!encoded) {
