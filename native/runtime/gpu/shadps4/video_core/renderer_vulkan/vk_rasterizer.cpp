@@ -3291,9 +3291,11 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             regs.depth_control.depth_func == AmdGpu::CompareFunc::Always;
         const bool base_fs_tri = regs.num_indices == 3 && regs.num_instances.NumInstances() <= 1 &&
                                  depth_always && ps_writes_all;
+        const bool base_fs_quad = regs.num_indices == 4 && regs.num_instances.NumInstances() <= 1 &&
+                                  depth_always && ps_writes_all;
         const bool no_stencil_reject = !ds_eff.stencil_test_enable;
-        const bool full_cov =
-            base_fs_tri && IsFullCoverageViewportScissor(regs, state.width, state.height);
+        const bool full_viewport = IsFullCoverageViewportScissor(regs, state.width, state.height);
+        const bool full_cov = base_fs_tri && full_viewport;
         const bool is_clear_draw =
             full_cov && vs32 == 0x2401e5acu && ps32 == 0xd1b8f55cu &&
             (no_stencil_reject || regs.depth_render_control.stencil_clear_enable);
@@ -3302,6 +3304,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             (vs32 == 0x3a537165u || vs32 == 0x8b1a1fbcu || vs32 == 0x56453c3eu);
         const bool is_lum_pyr = base_fs_tri && no_stencil_reject && vs32 == 0x5087a0e7u;
         const bool is_bloom_vs = full_cov && no_stencil_reject && vs32 == 0x9987a1e7u;
+        const bool is_godray_quad =
+            base_fs_quad && no_stencil_reject && full_viewport && vs32 == 0x77985107u &&
+            (ps32 == 0xddab4a1au || ps32 == 0x26080ea8u);
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
             if (!cb_descs[cb].first || state.color_attachments[cb].is_clear != 0) {
                 continue;
@@ -3313,7 +3318,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             if (was_undefined[cb] ||
                 (!img.binding.is_bound && !blended &&
                  (((is_clear_draw || is_fs_rgba || is_lum_pyr) && mask == 0xFu) ||
-                  (is_bloom_vs && (mask & 0x7u) == 0x7u)))) {
+                  ((is_bloom_vs || is_godray_quad) && (mask & 0x7u) == 0x7u)))) {
                 state.color_attachments[cb].is_clear = 2;
                 m1_profile.NoteDontCareLoad();
             }
@@ -4035,14 +4040,14 @@ void Rasterizer::NoteFrameStart() {
             if (st.frames > 0) {
                 const double f = double(st.frames);
                 std::printf("M1 TBDR/Profile (%llu frames, lvl %d, tbdr %d): skipped/frame "
-                            "shad=%.1f mblur=%.1f bloom=%.1f refl=%.1f noop=%.1f | "
+                            "shad=%.1f mblur=%.1f bloom=%.1f refl=%.1f god=%.1f noop=%.1f | "
                             "def_zclear=%.1f dont_care=%.1f | uma_stream=%.1f (%.1f KB) copy_breaks=%.1f\n",
                             static_cast<unsigned long long>(st.frames),
                             Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed),
                             int(m1_profile.TbdrOptEnabled()), st.shadows / f, st.motion_blur / f,
-                            st.bloom / f, st.reflections / f, st.noop / f, st.deferred_zclears / f,
-                            st.dont_care_loads / f, uma_hits / f, (uma_bytes / f) / 1024.0,
-                            copy_breaks / f);
+                            st.bloom / f, st.reflections / f, st.godrays / f, st.noop / f,
+                            st.deferred_zclears / f, st.dont_care_loads / f, uma_hits / f,
+                            (uma_bytes / f) / 1024.0, copy_breaks / f);
             }
         }
     }

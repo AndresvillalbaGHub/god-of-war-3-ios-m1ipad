@@ -357,10 +357,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         NoteHotUse(device_addr, size);
     }
     // For read-only buffers use unified/device-local stream buffer to avoid staging copies and
-    // renderpass breaks (M1 UMA extends this threshold via GOW3_UMA_STREAM_KB, default 32 KiB).
+    // renderpass breaks (M1 UMA extends this threshold via GOW3_UMA_STREAM_KB, default 32 KiB,
+    // gated to CPU-modified ranges during an active render pass so static buffers stay in arena).
     const u64 stream_limit = UmaStreamThreshold();
-    const bool use_uma_stream =
-        size > STREAM_THRESHOLD && size <= stream_limit && !stream_buffer.mapped_data.empty();
+    const bool use_uma_stream = size > STREAM_THRESHOLD && size <= stream_limit &&
+                                !stream_buffer.mapped_data.empty() && scheduler.IsRendering() &&
+                                IsRegionCpuModified(device_addr, size);
     if (!is_written && (size <= STREAM_THRESHOLD || use_uma_stream) &&
         !IsRegionGpuModified(device_addr, size)) {
         if (use_uma_stream) {

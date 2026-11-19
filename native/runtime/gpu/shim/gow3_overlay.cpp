@@ -446,9 +446,11 @@ void PerformanceTab() {
     auto& s = Gow3Settings::Get();
     ImGui::SeparatorText("Live");
     if (BeginRows("##live")) {
-        static const char* const fps_labels[] = {"30", "60", "120", "240", "Unlimited"};
+        static const char* const fps_labels[] = {
+            "20 (120Hz/6)", "24 (120Hz/5)", "30", "40 (120Hz/3)", "60", "120", "240", "Unlimited"};
+        static_assert(std::size(fps_labels) == G::FpsLimits.size());
         ChoiceRow("Frame rate limit", s.fps_limit, fps_labels, G::FpsLimits.data(), int(G::FpsLimits.size()),
-                  "Caps the frame rate. The engine frame rate (below) is the highest it can go.");
+                  "Caps the frame rate (20/24/40 match 120Hz ProMotion cleanly). The engine frame rate (below) is the ceiling.");
         const int effective = G::EffectiveFps(s.fps_limit, s.applied_engine_fps);
         if (s.fps_limit == 0 || effective < s.fps_limit) {
             char text[48];
@@ -463,10 +465,11 @@ void PerformanceTab() {
                   int(G::FramesQueued.size()), "More frames queued: steadier FPS, slower response to input.");
         CheckRow("Compile new shaders in the background", s.async_shaders,
                  "Fewer stutters in new areas; an object or effect may appear a moment later.");
-        static const char* const m1_labels[] = {"Off (Quality)", "Balanced (M1)", "Performance (M1)"};
-        static constexpr int m1_values[] = {0, 1, 2};
-        ChoiceRow("M1 TBDR profile", s.m1_profile, m1_labels, m1_values, 3,
-                  "Trims heavy secondary passes on Apple Silicon (shadows, bloom, motion blur, reflections). Live.");
+        static const char* const m1_labels[] = {
+            "Off (Quality)", "Balanced (M1)", "Performance (M1)", "Ultra (M1)"};
+        static constexpr int m1_values[] = {0, 1, 2, 3};
+        ChoiceRow("M1 TBDR profile", s.m1_profile, m1_labels, m1_values, 4,
+                  "Trims secondary passes on Apple Silicon (shadows, god-rays, bloom, motion blur, reflections). Live.");
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Applied on restart");

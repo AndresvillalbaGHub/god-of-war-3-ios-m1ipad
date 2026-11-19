@@ -19,8 +19,8 @@ inline constexpr std::array<std::string_view, DisplayModeCount> DisplayModeKeys 
 inline constexpr std::array<const char*, DisplayModeCount> DisplayModeNames = {
     "Windowed", "Borderless", "Fullscreen"};
 
-/// Present rate limits; 0 = unlimited.
-inline constexpr std::array<int, 5> FpsLimits = {30, 60, 120, 240, 0};
+/// Present rate limits (includes 20/24/40 exact divisors of 120 Hz ProMotion); 0 = unlimited.
+inline constexpr std::array<int, 8> FpsLimits = {20, 24, 30, 40, 60, 120, 240, 0};
 
 /// Game patch suffixes ("Resolution Patch - <name>"); "native" is no resolution patch.
 /// The last six are the Ultrawide mod's sizes (#202), built in as beta (scripts/graphics_options.py).

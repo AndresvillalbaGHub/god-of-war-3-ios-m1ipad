@@ -118,6 +118,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window_info.render_surface_scale = float(g_layer.contentsScale);
     width = s32(g_width);
     height = s32(g_height);
+    std::printf("Window: Metal layer %ux%u @ %u Hz (scale %.1f)\n", g_width, g_height,
+                g_refresh_hz, window_info.render_surface_scale);
     LOG_INFO(Frontend, "Window {}x{} on the app's CAMetalLayer, {} Hz", g_width, g_height, g_refresh_hz);
 }
 

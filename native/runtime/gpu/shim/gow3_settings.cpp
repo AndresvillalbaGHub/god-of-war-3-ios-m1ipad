@@ -148,7 +148,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.m1_profile = value == "off" ? 0
                      : value == "balanced" ? 1
                      : value == "performance" ? 2
-                     : std::clamp(i, 0, 2);
+                     : value == "ultra" ? 3
+                     : std::clamp(i, 0, 3);
     } else if (key == "output_res") {
         for (int r = 0; r < OutputCount; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {

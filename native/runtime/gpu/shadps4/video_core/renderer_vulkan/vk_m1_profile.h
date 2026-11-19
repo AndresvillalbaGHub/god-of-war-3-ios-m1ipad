@@ -15,6 +15,7 @@ enum class BloomMode : u8 {
     Full = 0,
     Lite = 1,
     Off = 2,
+    SceneOff = 3, // Skips lower mips always; skips base+composite only when seen_main_depth
 };
 
 struct M1ProfileConfig {
@@ -23,6 +24,7 @@ struct M1ProfileConfig {
     BloomMode bloom = BloomMode::Full;
     bool motion_blur = true;
     bool reflections = true;
+    bool godrays = true;
 
     static M1ProfileConfig Resolve(int profile_level) {
         struct EnvOverrides {
@@ -36,6 +38,8 @@ struct M1ProfileConfig {
             bool motion_blur = true;
             bool has_refl = false;
             bool reflections = true;
+            bool has_godrays = false;
+            bool godrays = true;
         };
         static const EnvOverrides env = [] {
             EnvOverrides o;
@@ -49,7 +53,9 @@ struct M1ProfileConfig {
             }
             if (const char* v = std::getenv("GOW3_M1_BLOOM"); v && v[0]) {
                 o.has_bloom = true;
-                if (std::strcmp(v, "off") == 0 || v[0] == '2') {
+                if (std::strcmp(v, "scene_off") == 0 || v[0] == '3') {
+                    o.bloom = BloomMode::SceneOff;
+                } else if (std::strcmp(v, "off") == 0 || v[0] == '2') {
                     o.bloom = BloomMode::Off;
                 } else if (std::strcmp(v, "lite") == 0 || v[0] == '1') {
                     o.bloom = BloomMode::Lite;
@@ -65,21 +71,33 @@ struct M1ProfileConfig {
                 o.has_refl = true;
                 o.reflections = v[0] != '0';
             }
+            if (const char* v = std::getenv("GOW3_M1_GODRAYS"); v && v[0]) {
+                o.has_godrays = true;
+                o.godrays = v[0] != '0';
+            }
             return o;
         }();
 
         M1ProfileConfig cfg;
-        const int level = std::clamp(profile_level, 0, 2);
+        const int level = std::clamp(profile_level, 0, 3);
         if (level == 1) {
             cfg.shadow_limit = 4;
             cfg.bloom = BloomMode::Lite;
             cfg.motion_blur = false;
             cfg.reflections = true;
+            cfg.godrays = true;
         } else if (level == 2) {
             cfg.shadow_limit = 2;
             cfg.bloom = BloomMode::Lite;
             cfg.motion_blur = false;
             cfg.reflections = false;
+            cfg.godrays = false;
+        } else if (level == 3) {
+            cfg.shadow_limit = 1;
+            cfg.bloom = BloomMode::SceneOff;
+            cfg.motion_blur = false;
+            cfg.reflections = false;
+            cfg.godrays = false;
         }
         if (env.has_tbdr) {
             cfg.tbdr_opt = env.tbdr_opt;
@@ -95,6 +113,9 @@ struct M1ProfileConfig {
         }
         if (env.has_refl) {
             cfg.reflections = env.reflections;
+        }
+        if (env.has_godrays) {
+            cfg.godrays = env.godrays;
         }
         return cfg;
     }
@@ -122,6 +143,7 @@ public:
         u64 motion_blur{};
         u64 bloom{};
         u64 reflections{};
+        u64 godrays{};
         u64 noop{};
         u64 deferred_zclears{};
         u64 dont_care_loads{};
@@ -154,6 +176,7 @@ public:
         static constexpr u32 kMBlurFeedbackPs = 0xd56574cfu;
         static constexpr u32 kMBlurCompositePs = 0xb4587d5du;
         static constexpr u32 kBloomVs = 0x9987a1e7u;
+        static constexpr u32 kGodRayVs = 0x77985107u;
 
         // Always learn transient secondary render target addresses so live profile toggles work
         // on the very next frame without restarting.
@@ -212,10 +235,19 @@ public:
             }
         }
 
-        // Multi-pass bloom pyramid (never skip tone-map/LUT ps 0xd27a6203).
+        // Radial god-ray / light-shaft chains after main depth (leave #21 occlusion query 0xd9bba52f intact).
+        if (!cfg.godrays && seen_main_depth && ctx.vs_hash32 == kGodRayVs &&
+            IsGodRayPs(ctx.ps_hash32)) {
+            ++stats.godrays;
+            return true;
+        }
+
+        // Multi-pass bloom pyramid (never skip tone-map/LUT ps 0xd27a6203; SceneOff preserves menus).
         if (cfg.bloom != BloomMode::Full && ctx.vs_hash32 == kBloomVs) {
+            const bool skip_base = cfg.bloom == BloomMode::Off ||
+                                   (cfg.bloom == BloomMode::SceneOff && seen_main_depth);
             if (IsBloomLowerMipPs(ctx.ps_hash32) ||
-                (cfg.bloom == BloomMode::Off && IsBloomBaseOrCompositePs(ctx.ps_hash32))) {
+                (skip_base && IsBloomBaseOrCompositePs(ctx.ps_hash32))) {
                 ++stats.bloom;
                 return true;
             }
@@ -256,6 +288,10 @@ private:
 
     static constexpr bool IsBloomBaseOrCompositePs(u32 ps) noexcept {
         return ps == 0x0439fa1bu || ps == 0xcecf26ddu || ps == 0xf9812259u || ps == 0xc9e7c40cu;
+    }
+
+    static constexpr bool IsGodRayPs(u32 ps) noexcept {
+        return ps == 0xddab4a1au || ps == 0x26080ea8u || ps == 0xb60ec3ccu;
     }
 
     static constexpr bool IsUiMovieVs(u32 vs) noexcept {

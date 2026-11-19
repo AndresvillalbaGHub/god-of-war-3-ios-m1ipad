@@ -18,7 +18,7 @@ const listControllers = () => (typeof Gow3Core.controllers === 'function' ? Gow3
 // The on-screen controls switch is new in 0.1.44, the FPS cap in 0.1.45; older installed IPAs lack them.
 const hasTouchControls = typeof Gow3Core.touchControlsEnabled === 'function';
 const hasFpsLimit = typeof Gow3Core.fpsLimit === 'function';
-const FPS_LIMITS = [30, 60, 0];
+const FPS_LIMITS = [20, 24, 30, 40, 60, 0];
 
 const color = {
   bg: '#07070a',
@@ -323,9 +323,11 @@ export default function App() {
                 <QuickTile
                   title="FRAME CAP"
                   value={fpsLimit ? `${fpsLimit} FPS` : 'Off'}
-                  detail={files.started ? 'Next start' : fpsLimit === 30 ? 'Steady, cooler' : 'Tap to change'}
+                  detail={
+                    files.started ? 'Next start' : fpsLimit > 0 && fpsLimit <= 40 ? 'Steady, cooler' : 'Tap to change'
+                  }
                   onPress={cycleFps}
-                  active={fpsLimit === 30}
+                  active={fpsLimit > 0 && fpsLimit <= 40}
                 />
               ) : null}
               {hasTouchControls ? (

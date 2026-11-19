@@ -30,6 +30,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #ifdef __APPLE__
+#include <TargetConditionals.h>
 extern "C" unsigned long long gow3_flip_count; // gow3 (iOS): defined in ios/gow3_start.c
 #endif
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -676,17 +677,35 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // gow3: the in-game menu changes the limit live (Gow3Settings::fps_limit); GOW3_FPS_LIMIT
     // and the uncapped presets keep their fixed limit.
     const bool fixed_limit = std::getenv("GOW3_FPS_LIMIT") || EmulatorSettings.GetVblankFrequency() == 480;
+    // gow3 (iOS ProMotion): when fps_limit=0 (Unlimited) keep immediate_flips active by capping
+    // at applied_engine_fps so frames present as soon as finished (~1-2 ms pacing stddev instead
+    // of 16.67 ms 60 Hz vblank quantization), while menus/light scenes still respect engine speed.
+    const bool ios_immediate_pacing = [] {
+#if defined(__APPLE__) && TARGET_OS_IOS
+        const char* env = std::getenv("GOW3_IMMEDIATE_FLIPS");
+        return !(env && env[0] == '0');
+#else
+        return false;
+#endif
+    }();
     const auto current_limit = [&] {
         const auto& s = Gow3Settings::Get();
-        return fixed_limit ? EmulatorSettings.GetFrameLimit()
-                           : u32(Gow3Graphics::PresentLimit(s.fps_limit, s.applied_engine_fps));
+        if (fixed_limit) {
+            return EmulatorSettings.GetFrameLimit();
+        }
+        const int limit = s.fps_limit.load();
+        if (ios_immediate_pacing && limit == 0) {
+            return u32(Gow3Graphics::EffectiveFps(0, s.applied_engine_fps));
+        }
+        return u32(Gow3Graphics::PresentLimit(limit, s.applied_engine_fps));
     };
     u32 frame_limit = current_limit();
     auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
                                     : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
-    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
-                EmulatorSettings.GetVblankFrequency(), frame_limit);
+    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS (immediate flips %s)\n",
+                EmulatorSettings.GetVblankFrequency(), frame_limit,
+                frame_limit != 0 ? "on" : "off");
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
