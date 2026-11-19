@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <boost/container/small_vector.hpp>
 #include "gow3_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -197,6 +198,11 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     BeforeImageAccess();
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
+    if ((image->pending_depth_clear || image->pending_stencil_clear) &&
+        dst_layout != vk::ImageLayout::eDepthStencilAttachmentOptimal &&
+        dst_layout != vk::ImageLayout::eDepthAttachmentOptimal) {
+        FlushPendingDepthClear(image);
+    }
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
     return image_barriers.size() != prev_num_barriers;
@@ -795,6 +801,54 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+void Runtime::FlushPendingDepthClear(VideoCore::Image* image) {
+    const bool clear_d = image->pending_depth_clear;
+    const bool clear_s = image->pending_stencil_clear;
+    if (!clear_d && !clear_s) {
+        return;
+    }
+    const float depth_val = std::bit_cast<float>(image->pending_depth_clear_value);
+    const u32 stencil_val = image->pending_stencil_clear_value;
+    image->pending_depth_clear = false;
+    image->pending_stencil_clear = false;
+    if (!image->backing || !image->GetImage()) {
+        return;
+    }
+    vk::ImageAspectFlags aspect{};
+    if (clear_d) {
+        aspect |= vk::ImageAspectFlagBits::eDepth;
+    }
+    if (clear_s) {
+        aspect |= vk::ImageAspectFlagBits::eStencil;
+    }
+    aspect &= image->aspect_mask;
+    if (!aspect) {
+        return;
+    }
+    scheduler.EndRendering();
+    if (Transit(image, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
+                vk::AccessFlagBits2::eTransferWrite)) {
+        FlushBarriers();
+    }
+    const vk::ImageSubresourceRange vk_range = {
+        .aspectMask = aspect,
+        .baseMipLevel = 0,
+        .levelCount = image->info.resources.levels,
+        .baseArrayLayer = 0,
+        .layerCount = image->info.resources.layers,
+    };
+    const vk::ClearDepthStencilValue clear_val{
+        .depth = depth_val,
+        .stencil = stencil_val,
+    };
+    scheduler.Record([img = image->GetImage(), clear_val, vk_range](vk::CommandBuffer cmdbuf) {
+        cmdbuf.clearDepthStencilImage(img, vk::ImageLayout::eTransferDstOptimal, clear_val,
+                                      vk_range);
+    });
+    image->flags |= VideoCore::ImageFlagBits::GpuModified;
+    image->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {

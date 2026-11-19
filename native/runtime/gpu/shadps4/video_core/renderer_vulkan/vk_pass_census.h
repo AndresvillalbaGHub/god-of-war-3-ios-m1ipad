@@ -84,7 +84,7 @@ struct State {
     bool feedback_loop{};
     std::pair<std::uint32_t, std::uint32_t> area{};       ///< render area
     std::pair<std::uint32_t, std::uint32_t> depth_size{}; ///< the depth image, 0x0 without one
-    std::vector<std::uint8_t> color_clears;               ///< 1 if CB meta-cleared (eClear), else 0 (eLoad)
+    std::vector<std::uint8_t> color_clears;               ///< 0=eLoad(L), 1=eClear(C), 2=eDontCare(D)
     std::vector<std::uint8_t> color_blends;               ///< 1 if blend enabled on CB, else 0
     std::vector<std::uint8_t> color_masks;                ///< 4-bit RGBA write mask per CB (0xF = full)
     bool depth_readonly{};                                ///< true if depth attachment layout is read-only
@@ -120,7 +120,7 @@ inline std::string Format(const State& s) {
             if (i) {
                 out += ',';
             }
-            out += s.color_clears[i] ? 'C' : 'L';
+            out += s.color_clears[i] == 1 ? 'C' : s.color_clears[i] == 2 ? 'D' : 'L';
             out += (i < s.color_blends.size() && s.color_blends[i]) ? 'b' : '-';
             if (i < s.color_masks.size()) {
                 constexpr char hex[] = "0123456789abcdef";

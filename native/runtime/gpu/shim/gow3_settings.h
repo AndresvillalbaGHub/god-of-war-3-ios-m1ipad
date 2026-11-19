@@ -69,8 +69,11 @@ struct Values {
     // frame rate swing; at 30 a session held a 28.8 median with no sample under 21 (2026-10-25).
     // The launcher, gow3.ini fps_limit= or the menu changes it (60 or none for testing).
     std::atomic<int> fps_limit{30};
+    // gow3 (M1): 0=Off(Quality), 1=Balanced(M1), 2=Performance(M1). Live.
+    std::atomic<int> m1_profile{1};
 #else
     std::atomic<int> fps_limit{0};
+    std::atomic<int> m1_profile{0};
 #endif
     std::atomic<bool> async_shaders{true};
     std::atomic<bool> fsr1{false};

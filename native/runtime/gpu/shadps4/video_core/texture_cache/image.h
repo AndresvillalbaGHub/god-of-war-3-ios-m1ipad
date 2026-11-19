@@ -153,6 +153,10 @@ public:
         u32 vo_surface : 1;
     } usage{};
     bool scene_proxy = false; ///< gow3: SceneTargets holds a reduced-size proxy of it
+    bool pending_depth_clear = false;
+    bool pending_stencil_clear = false;
+    u32 pending_depth_clear_value = 0;
+    u32 pending_stencil_clear_value = 0;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     VAddr guest_begin = 0; ///< info.guest_address

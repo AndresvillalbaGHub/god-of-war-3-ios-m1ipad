@@ -463,6 +463,10 @@ void PerformanceTab() {
                   int(G::FramesQueued.size()), "More frames queued: steadier FPS, slower response to input.");
         CheckRow("Compile new shaders in the background", s.async_shaders,
                  "Fewer stutters in new areas; an object or effect may appear a moment later.");
+        static const char* const m1_labels[] = {"Off (Quality)", "Balanced (M1)", "Performance (M1)"};
+        static constexpr int m1_values[] = {0, 1, 2};
+        ChoiceRow("M1 TBDR profile", s.m1_profile, m1_labels, m1_values, 3,
+                  "Trims heavy secondary passes on Apple Silicon (shadows, bloom, motion blur, reflections). Live.");
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Applied on restart");

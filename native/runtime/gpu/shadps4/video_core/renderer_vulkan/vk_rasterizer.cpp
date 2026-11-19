@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+#include <chrono>
+#include <cmath>
 #include <xxhash.h>
+#include "gow3_settings.h"
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "gow3_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -57,6 +61,76 @@ static u32 CountAttachmentLoads(const RenderState& state) {
         ++loads;
     }
     return loads;
+}
+
+static bool PipelineHasShaderWrites(const GraphicsPipeline* pipeline) {
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& buf : stage->buffers) {
+            if (!buf.IsSpecial() && buf.is_written) {
+                return true;
+            }
+        }
+        for (const auto& img : stage->images) {
+            if (img.is_written) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool IsFullCoverageViewportScissor(const AmdGpu::Regs& regs, u32 width, u32 height) {
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    const bool enable_offset = !regs.window_scissor.window_offset_disable;
+    const s32 x_off = enable_offset ? regs.window_offset.window_x_offset : 0;
+    const s32 y_off = enable_offset ? regs.window_offset.window_y_offset : 0;
+    s32 x0 = std::max<s32>({s32(regs.screen_scissor.top_left_x),
+                            s32(regs.window_scissor.top_left_x) + x_off,
+                            s32(regs.generic_scissor.top_left_x) + x_off});
+    s32 y0 = std::max<s32>({s32(regs.screen_scissor.top_left_y),
+                            s32(regs.window_scissor.top_left_y) + y_off,
+                            s32(regs.generic_scissor.top_left_y) + y_off});
+    s32 x1 = std::min<s32>({s32(regs.screen_scissor.bottom_right_x),
+                            s32(regs.window_scissor.bottom_right_x) + x_off,
+                            s32(regs.generic_scissor.bottom_right_x) + x_off});
+    s32 y1 = std::min<s32>({s32(regs.screen_scissor.bottom_right_y),
+                            s32(regs.window_scissor.bottom_right_y) + y_off,
+                            s32(regs.generic_scissor.bottom_right_y) + y_off});
+    if (regs.mode_control.vport_scissor_enable) {
+        x0 = std::max<s32>(x0, s32(regs.viewport_scissors[0].top_left_x));
+        y0 = std::max<s32>(y0, s32(regs.viewport_scissors[0].top_left_y));
+        x1 = std::min<s32>(x1, s32(regs.viewport_scissors[0].bottom_right_x));
+        y1 = std::min<s32>(y1, s32(regs.viewport_scissors[0].bottom_right_y));
+    }
+    if (std::max<s32>(0, x0) > 0 || std::max<s32>(0, y0) > 0 || x1 < s32(width) ||
+        y1 < s32(height)) {
+        return false;
+    }
+    if (regs.IsClipDisabled()) {
+        return true;
+    }
+    const auto& vp_ctl = regs.viewport_control;
+    const auto& vp = regs.viewports[0];
+    if (vp.xscale == 0.f) {
+        return false;
+    }
+    const float xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+    const float xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
+    const float yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+    const float yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
+    const float ax = std::fabs(xscale);
+    const float ay = std::fabs(yscale);
+    if (ax <= 0.f || ay <= 0.f) {
+        return false;
+    }
+    return (xoffset - ax) <= 0.5f && (yoffset - ay) <= 0.5f &&
+           (xoffset + ax) >= float(width) - 0.5f &&
+           (yoffset + ay) >= float(height) - 0.5f;
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
@@ -1039,6 +1113,69 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                          cb_descs[0].first, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
+    }
+    {
+        const auto& gkey = pipeline->GetGraphicsKey();
+        const u32 num_cb = u32(std::bit_width(gkey.mrt_mask));
+        M1DrawContext dctx;
+        dctx.vs_hash32 = u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+        const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        dctx.ps_hash32 = ps_stage ? u32(ps_stage->pgm_hash) : 0u;
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            if (cb_descs[cb].first) {
+                ++dctx.num_bound_colors;
+            }
+        }
+        if (num_cb > 0 && cb_descs[0].first) {
+            const auto& c0 = texture_cache.GetImage(cb_descs[0].first);
+            dctx.cb0_addr = c0.info.guest_address;
+            dctx.cb0_width = c0.info.size.width;
+            dctx.cb0_height = c0.info.size.height;
+            dctx.cb0_unorm8 = (c0.info.pixel_format == vk::Format::eR8G8B8A8Unorm);
+        }
+        if (db_desc.first) {
+            const auto& d_img = texture_cache.GetImage(db_desc.first);
+            dctx.has_depth = true;
+            dctx.depth_width = d_img.info.size.width;
+            dctx.depth_height = d_img.info.size.height;
+        }
+        dctx.depth_clear_enable = regs.depth_render_control.depth_clear_enable &&
+                                  regs.depth_control.depth_enable &&
+                                  regs.depth_control.depth_write_enable;
+        if (m1_profile.ShouldSkipDraw(dctx)) {
+            bind_prepared = nullptr;
+            ResetBindings(false);
+            return;
+        }
+        if (m1_profile.TbdrOptEnabled() && dctx.num_bound_colors == 0 && !dctx.has_depth &&
+            dctx.ps_hash32 == 0 && !PipelineHasShaderWrites(pipeline)) {
+            m1_profile.NoteNoop();
+            bind_prepared = nullptr;
+            ResetBindings(false);
+            return;
+        }
+        if (m1_profile.TbdrOptEnabled() && dctx.num_bound_colors == 0 && dctx.has_depth &&
+            dctx.ps_hash32 == 0 && dctx.depth_clear_enable && !scene_targets->Reduced() &&
+            !PipelineHasShaderWrites(pipeline)) {
+            auto& depth_img = texture_cache.GetImage(db_desc.first);
+            if (depth_img.info.resources.layers == 1 && depth_img.info.resources.levels == 1) {
+                scheduler.EndRendering();
+                begin_memo.valid = false;
+                texture_cache.UpdateImage(db_desc.first);
+                depth_img.pending_depth_clear = true;
+                depth_img.pending_depth_clear_value = std::bit_cast<u32>(regs.depth_clear);
+                if (regs.depth_render_control.stencil_clear_enable &&
+                    regs.depth_buffer.StencilValid()) {
+                    depth_img.pending_stencil_clear = true;
+                    depth_img.pending_stencil_clear_value = regs.stencil_clear;
+                }
+                depth_img.flags |= VideoCore::ImageFlagBits::GpuModified;
+                m1_profile.NoteDeferredZClear();
+                bind_prepared = nullptr;
+                ResetBindings(false);
+                return;
+            }
+        }
     }
     const PreparedDraw* draw_prepared = bind_prepared;
     // gow3: vertex and index buffers are resolved while the helper binds textures (their
@@ -2864,6 +3001,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    std::array<bool, AmdGpu::NUM_COLOR_BUFFERS> was_undefined{};
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -2885,6 +3023,13 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+
+        const u32 subres_idx = mip * image->info.resources.layers + slice;
+        const auto prev_layout = (!image->backing->subresource_states.empty() &&
+                                  subres_idx < image->backing->subresource_states.size())
+                                     ? image->backing->subresource_states[subres_idx].layout
+                                     : image->backing->state.layout;
+        was_undefined[cb] = (prev_layout == vk::ImageLayout::eUndefined);
 
         if (reduced) {
             // The native image is resolved lazily when a shader/copy actually reads it.
@@ -2948,11 +3093,19 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
-        const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        const bool pending_d = image.pending_depth_clear;
+        const bool pending_s = image.pending_stencil_clear;
+        const u32 pending_d_val = image.pending_depth_clear_value;
+        const u32 pending_s_val = image.pending_stencil_clear_value;
+        image.pending_depth_clear = false;
+        image.pending_stencil_clear = false;
+        const bool reg_depth_clear =
+            regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
+            regs.depth_control.depth_write_enable;
+        const bool htile_depth_clear = texture_cache.IsMetaCleared(htile_address, slice);
+        const bool is_depth_clear = reg_depth_clear || htile_depth_clear || pending_d;
+        const bool reg_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        const bool is_stencil_clear = reg_stencil_clear || pending_s;
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
@@ -2960,32 +3113,39 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         // Stencil writes can be enabled while depth writes are off.
         const bool stencil_write =
             has_stencil && regs.depth_control.stencil_enable && !desc.view_info.is_storage;
-        const auto new_layout = desc.view_info.is_storage
-                                    ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                                  : vk::ImageLayout::eDepthAttachmentOptimal
-                                : stencil_write
-                                    ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
-                                : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
+        const bool depth_write_layout = desc.view_info.is_storage || is_depth_clear;
+        const bool stencil_write_layout = stencil_write || (has_stencil && is_stencil_clear);
+        const auto new_layout =
+            depth_write_layout
+                ? (has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                               : vk::ImageLayout::eDepthAttachmentOptimal)
+            : stencil_write_layout
+                ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+            : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                          : vk::ImageLayout::eDepthReadOnlyOptimal;
         if (census_on) {
             census.depth_samples = u8(regs.depth_buffer.NumSamples());
             census.stencil_test = regs.depth_control.stencil_enable;
             census.stencil_write = stencil_write;
             census.stencil_clear = is_stencil_clear;
             census.depth_clear = !is_depth_clear ? PassCensus::DepthClear::None
-                                 : texture_cache.IsMetaCleared(htile_address, slice)
-                                     ? PassCensus::DepthClear::Htile
-                                     : PassCensus::DepthClear::Register;
+                                 : htile_depth_clear ? PassCensus::DepthClear::Htile
+                                                     : PassCensus::DepthClear::Register;
             census.depth_layout = vk::to_string(new_layout);
             census.depth_size = {image.info.size.width, image.info.size.height};
-            census.depth_readonly = !desc.view_info.is_storage;
+            census.depth_readonly = !depth_write_layout;
         }
-        if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        const vk::AccessFlags2 depth_access =
+            (depth_write_layout || stencil_write_layout)
+                ? (vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                   vk::AccessFlagBits2::eDepthStencilAttachmentRead)
+                : vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+        if (!reduced) {
+            needs_barrier |= runtime.Transit(&image, new_layout,
+                                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                 vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                             depth_access, desc.view_info.range);
+        }
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -2998,12 +3158,15 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         attachment.is_clear = 0;
 
         if (regs.depth_buffer.DepthValid()) {
-            attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+            const u32 d_val =
+                pending_d && !reg_depth_clear ? pending_d_val : std::bit_cast<u32>(regs.depth_clear);
+            attachment.clear_value[0] = is_depth_clear ? d_val : 0u;
             attachment.has_depth = true;
             attachment.depth_clear = is_depth_clear;
         }
         if (regs.depth_buffer.StencilValid()) {
-            attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;
+            const u32 s_val = pending_s && !reg_stencil_clear ? pending_s_val : regs.stencil_clear;
+            attachment.clear_value[1] = is_stencil_clear ? s_val : 0u;
             attachment.has_stencil = true;
             attachment.stencil_clear = is_stencil_clear;
         }
@@ -3113,17 +3276,56 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.height = proxy.height;
         target_scale = {float(size.width) / 1920.0f, float(size.height) / 1080.0f};
     }
+    if (m1_profile.TbdrOptEnabled() && !reduced && !color_redirected &&
+        state.num_color_attachments > 0) {
+        const auto ds_eff = GetEffectiveDepthStencilState(regs);
+        const u32 vs32 = u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+        const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const u32 ps32 = ps_stage ? u32(ps_stage->pgm_hash) : 0u;
+        const bool ps_writes_all = ps_stage && !ps_stage->has_discard;
+        const bool depth_always =
+            !ds_eff.depth_test_enable || !regs.depth_control.depth_enable ||
+            regs.depth_control.depth_func == AmdGpu::CompareFunc::Always;
+        const bool base_fs_tri = regs.num_indices == 3 && regs.num_instances.NumInstances() <= 1 &&
+                                 depth_always && ps_writes_all;
+        const bool no_stencil_reject = !ds_eff.stencil_test_enable;
+        const bool full_cov =
+            base_fs_tri && IsFullCoverageViewportScissor(regs, state.width, state.height);
+        const bool is_clear_draw =
+            full_cov && vs32 == 0x2401e5acu && ps32 == 0xd1b8f55cu &&
+            (no_stencil_reject || regs.depth_render_control.stencil_clear_enable);
+        const bool is_fs_rgba =
+            full_cov && no_stencil_reject &&
+            (vs32 == 0x3a537165u || vs32 == 0x8b1a1fbcu || vs32 == 0x56453c3eu);
+        const bool is_lum_pyr = base_fs_tri && no_stencil_reject && vs32 == 0x5087a0e7u;
+        const bool is_bloom_vs = full_cov && no_stencil_reject && vs32 == 0x9987a1e7u;
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (!cb_descs[cb].first || state.color_attachments[cb].is_clear != 0) {
+                continue;
+            }
+            const auto& img = texture_cache.GetImage(cb_descs[cb].first);
+            const bool blended =
+                regs.blend_control[cb].enable && !regs.color_buffers[cb].info.blend_bypass;
+            const u32 mask = regs.color_target_mask.GetMask(cb) & 0xFu;
+            if (was_undefined[cb] ||
+                (!img.binding.is_bound && !blended &&
+                 (((is_clear_draw || is_fs_rgba || is_lum_pyr) && mask == 0xFu) ||
+                  (is_bloom_vs && (mask & 0x7u) == 0x7u)))) {
+                state.color_attachments[cb].is_clear = 2;
+                m1_profile.NoteDontCareLoad();
+            }
+        }
+    }
     if (census_on) {
         std::array<const VideoCore::ImageInfo*, AmdGpu::NUM_COLOR_BUFFERS> colors{};
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
             if (cb_descs[cb].first) {
                 colors[cb] = &texture_cache.GetImage(cb_descs[cb].first).info;
                 census.color_samples.push_back(u8(regs.color_buffers[cb].NumSamples()));
-                const bool cleared = state.color_attachments[cb].is_clear != 0;
                 const bool blended =
                     regs.blend_control[cb].enable && !regs.color_buffers[cb].info.blend_bypass;
                 const u8 mask = u8(regs.color_target_mask.GetMask(cb) & 0xFu);
-                census.color_clears.push_back(cleared ? 1 : 0);
+                census.color_clears.push_back(static_cast<u8>(state.color_attachments[cb].is_clear));
                 census.color_blends.push_back(blended ? 1 : 0);
                 census.color_masks.push_back(mask);
             }
@@ -3813,6 +4015,26 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
 }
 
 void Rasterizer::NoteFrameStart() {
+    m1_profile.OnFrameStart(Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed));
+    if (Gow3Stats::enabled) {
+        static auto last_log = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log >= std::chrono::seconds(5)) {
+            last_log = now;
+            const auto st = m1_profile.ConsumeStats();
+            if (st.frames > 0) {
+                const double f = double(st.frames);
+                std::printf("M1 TBDR/Profile (%llu frames, lvl %d, tbdr %d): skipped/frame "
+                            "shad=%.1f mblur=%.1f bloom=%.1f refl=%.1f noop=%.1f | "
+                            "def_zclear=%.1f dont_care=%.1f\n",
+                            static_cast<unsigned long long>(st.frames),
+                            Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed),
+                            int(m1_profile.TbdrOptEnabled()), st.shadows / f, st.motion_blur / f,
+                            st.bloom / f, st.reflections / f, st.noop / f, st.deferred_zclears / f,
+                            st.dont_care_loads / f);
+            }
+        }
+    }
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->BeginFrame();
     }

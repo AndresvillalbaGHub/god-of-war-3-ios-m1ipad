@@ -84,8 +84,28 @@ void Scheduler::RecordFullBarrier(vk::CommandBuffer cmdbuf) {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
-    if (is_rendering && render_state == new_state) {
-        return;
+    if (is_rendering) {
+        if (render_state == new_state) {
+            return;
+        }
+        bool any_dont_care = false;
+        for (u32 i = 0; i < new_state.num_color_attachments; ++i) {
+            if (new_state.color_attachments[i].is_clear == 2) {
+                any_dont_care = true;
+                break;
+            }
+        }
+        if (any_dont_care) {
+            RenderState cont = new_state;
+            for (u32 i = 0; i < cont.num_color_attachments; ++i) {
+                if (cont.color_attachments[i].is_clear == 2) {
+                    cont.color_attachments[i].is_clear = 0;
+                }
+            }
+            if (render_state == cont) {
+                return;
+            }
+        }
     }
     EndRendering();
     is_rendering = true;
@@ -93,7 +113,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     {
         u64 loads = 0;
         for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
-            loads += render_state.color_attachments[i].is_clear ? 0 : 1;
+            const auto& ca = render_state.color_attachments[i];
+            if (ca.image_view && ca.is_clear == 0) {
+                ++loads;
+            }
         }
         const auto& ds = render_state.depth_stencil_attachment;
         loads += (ds.has_depth && !ds.depth_clear) || (ds.has_stencil && !ds.stencil_clear) ? 1 : 0;
@@ -104,21 +127,42 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
         const auto& cb = render_state.color_attachments[i];
+        const auto load_op = !cb.image_view     ? vk::AttachmentLoadOp::eDontCare
+                             : cb.is_clear == 1 ? vk::AttachmentLoadOp::eClear
+                             : cb.is_clear == 2 ? vk::AttachmentLoadOp::eDontCare
+                                                : vk::AttachmentLoadOp::eLoad;
+        const auto store_op =
+            cb.image_view ? vk::AttachmentStoreOp::eStore : vk::AttachmentStoreOp::eDontCare;
         color_attachments[i] = vk::RenderingAttachmentInfo{
             .imageView = cb.image_view,
             .imageLayout = cb.image_layout,
-            .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-            .storeOp = vk::AttachmentStoreOp::eStore,
+            .loadOp = load_op,
+            .storeOp = store_op,
             .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
         };
     }
 
     const auto& db = render_state.depth_stencil_attachment;
+    const bool allow_store_none = instance.IsLoadStoreOpNoneSupported();
+    const bool depth_readonly_layout =
+        db.image_layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+        db.image_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+        db.image_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
+    const bool stencil_readonly_layout =
+        db.image_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+        db.image_layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+        db.image_layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+    const auto depth_store_op = (allow_store_none && depth_readonly_layout && !db.depth_clear)
+                                    ? vk::AttachmentStoreOp::eNone
+                                    : vk::AttachmentStoreOp::eStore;
+    const auto stencil_store_op = (allow_store_none && stencil_readonly_layout && !db.stencil_clear)
+                                      ? vk::AttachmentStoreOp::eNone
+                                      : vk::AttachmentStoreOp::eStore;
     const vk::RenderingAttachmentInfo depth_attachment = {
         .imageView = db.image_view,
         .imageLayout = db.image_layout,
         .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
+        .storeOp = depth_store_op,
         .clearValue =
             vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{.depth = std::bit_cast<float>(
                                                                           db.clear_value[0])}},
@@ -127,7 +171,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .imageView = db.image_view,
         .imageLayout = db.image_layout,
         .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
+        .storeOp = stencil_store_op,
         .clearValue = vk::ClearValue{.depthStencil =
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
@@ -144,6 +188,23 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
+
+    // Clear one-shot loadOp flags on the active pass state so Draw #2 (is_clear=0) stays in
+    // the same render pass instead of splitting and reloading tile memory from RAM.
+    for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
+        if (render_state.color_attachments[i].is_clear != 0) {
+            render_state.color_attachments[i].is_clear = 0;
+            render_state.color_attachments[i].clear_value = {};
+        }
+    }
+    if (render_state.depth_stencil_attachment.depth_clear) {
+        render_state.depth_stencil_attachment.depth_clear = false;
+        render_state.depth_stencil_attachment.clear_value[0] = 0;
+    }
+    if (render_state.depth_stencil_attachment.stencil_clear) {
+        render_state.depth_stencil_attachment.stencil_clear = false;
+        render_state.depth_stencil_attachment.clear_value[1] = 0;
+    }
 
     if (!recording_threaded) {
         if (FullBarriers()) {
