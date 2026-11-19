@@ -53,11 +53,22 @@ static StreamPlacement StreamMemory() {
 }
 
 [[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
+#ifdef __APPLE__
+    // gow3 (M1 UMA): Apple Silicon shares one physical DRAM between CPU and GPU
+    // (MTLStorageModeShared = DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | HOST_CACHED).
+    // Preferring all three keeps stream and staging buffers in unified cached shared memory.
+    if (type != MemoryType::DeviceLocal && type != MemoryType::Sparse) {
+        return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+               VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
+    return VkMemoryPropertyFlagBits{};
+#else
     if (type == MemoryType::Stream && StreamMemory() == StreamPlacement::Cached) {
         return VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     }
     return type != MemoryType::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                                            : VkMemoryPropertyFlagBits{};
+#endif
 }
 
 [[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {

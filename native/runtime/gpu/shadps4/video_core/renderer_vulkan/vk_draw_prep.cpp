@@ -51,9 +51,19 @@ u32 DefaultWorkerCount() {
     if (const char* env = std::getenv("GOW3_PREP_WORKERS")) {
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
     }
+#ifdef __APPLE__
+    // Fit scanner (1) + workers onto Apple Silicon Efficiency cores so speculative prep
+    // never spills onto the 4 Performance cores used by guest threads and command recording.
+    const u32 e_cores = Gow3Threads::EfficiencyCores();
+    if (e_cores > 0) {
+        return std::clamp<u32>(e_cores > 1 ? e_cores - 1 : 1u, 1u, 4u);
+    }
+    return std::clamp<u32>(Gow3Threads::Available() / 2, 1u, 3u);
+#else
     // Workers are SCHED_IDLE and claim whole buffers, so more of them only use more idle
     // cores: half the hardware threads (Steam Deck 4, 16-thread desktop 8).
     return std::clamp<u32>(Gow3Threads::Available() / 2, 1, 8);
+#endif
 }
 
 /// Flattened user data of one submission: chunks never move, so the GPU thread can read a
@@ -205,8 +215,14 @@ DrawPreparation::DrawPreparation(PipelineCache& pipeline_cache_)
     for (u32 i = 0; i < worker_count; ++i) {
         workers.emplace_back([this, i](std::stop_token stop) { WorkerLoop(stop, i); });
     }
+#ifdef __APPLE__
+    std::printf("GPU: draw preparation workers: %u (+1 scanner, %u hardware threads: %uP+%uE)\n",
+                worker_count, Gow3Threads::Available(), Gow3Threads::PerformanceCores(),
+                Gow3Threads::EfficiencyCores());
+#else
     std::printf("GPU: draw preparation workers: %u (+1 scanner, %u hardware threads)\n",
                 worker_count, Gow3Threads::Available());
+#endif
 }
 
 DrawPreparation::~DrawPreparation() {

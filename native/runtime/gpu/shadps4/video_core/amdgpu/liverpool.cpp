@@ -8,6 +8,7 @@
 #endif
 #include <time.h>
 #include "gow3_copy.h"
+#include "gow3_threads.h"
 #include "gow3_toggles.h"
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>
@@ -104,6 +105,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    Gow3Threads::MakeInteractive();
 #ifdef __APPLE__
     // gow3 (iOS): no per-thread CPU clocks; the GPU thread's CPU time stays unreported.
 #elif !defined(_WIN32)

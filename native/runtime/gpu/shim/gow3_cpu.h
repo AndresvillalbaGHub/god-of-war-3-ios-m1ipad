@@ -27,6 +27,10 @@ inline std::uint64_t Cycles() {
 inline void Pause() {
 #if defined(__x86_64__)
     __builtin_ia32_pause();
+#elif defined(__aarch64__) && defined(__APPLE__)
+    // Apple Silicon executes AArch64 `yield` as a 1-cycle NOP; `isb` pauses the pipeline
+    // (~30-50 cycles) like x86 PAUSE without burning P-core power/thermals in spin-waits.
+    asm volatile("isb" ::: "memory");
 #elif defined(__aarch64__)
     asm volatile("yield");
 #endif

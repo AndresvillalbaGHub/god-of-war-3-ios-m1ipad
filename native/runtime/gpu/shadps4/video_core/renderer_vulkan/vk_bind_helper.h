@@ -10,6 +10,7 @@
 #include <chrono>
 #include <thread>
 #include "gow3_cpu.h"
+#include "gow3_threads.h"
 
 #include "common/thread.h"
 #include "common/types.h"
@@ -71,8 +72,12 @@ public:
         const u64 target = posted.load(std::memory_order_relaxed);
         if (done.load(std::memory_order_acquire) != target) {
             const u64 start = Gow3Cpu::Cycles();
-            while (done.load(std::memory_order_acquire) != target) {
-                Gow3Cpu::Pause();
+            for (u32 spins = 0; done.load(std::memory_order_acquire) != target; ++spins) {
+                if (spins < 256) {
+                    Gow3Cpu::Pause();
+                } else {
+                    std::this_thread::yield();
+                }
             }
             wait_cycles += Gow3Cpu::Cycles() - start;
         }
@@ -86,12 +91,19 @@ public:
 private:
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("gow3:TexBind");
+        Gow3Threads::MakeInitiated();
         on_helper = true;
         u64 seen = 0;
         while (!stop.stop_requested()) {
             // Draws arrive every few microseconds while a frame is recorded: spin, and sleep
-            // only after a pause longer than that (between frames).
-            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            // only after a pause longer than that (between frames). On Apple M1 keep spins short.
+            static constexpr auto kSpinTime =
+#ifdef __APPLE__
+                std::chrono::microseconds(10);
+#else
+                std::chrono::microseconds(100);
+#endif
+            const auto spin_until = std::chrono::steady_clock::now() + kSpinTime;
             u64 now = posted.load(std::memory_order_acquire);
             for (u32 spins = 1; now == seen; ++spins) {
                 Gow3Cpu::Pause();

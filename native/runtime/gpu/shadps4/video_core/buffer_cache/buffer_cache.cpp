@@ -53,6 +53,31 @@ std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& prop
     return std::nullopt;
 }
 
+namespace {
+
+/// gow3 (M1 UMA): unified-memory stream threshold in bytes (defaults to 32 KiB on Apple Silicon
+/// so 16-32 KiB read-only dynamic buffers write directly into coherent cached MTLStorageModeShared
+/// stream memory instead of staging + vkCmdCopyBuffer + EndRendering TBDR pass breaks).
+u64 UmaStreamThreshold() {
+    static const u64 threshold = [] {
+        if (const char* env = std::getenv("GOW3_UMA_STREAM_KB"); env && env[0]) {
+            const u64 kib = std::strtoull(env, nullptr, 10);
+            if (kib == 0) {
+                return VideoCore::BufferCache::STREAM_THRESHOLD;
+            }
+            return std::clamp<u64>(kib, 16, 256) * 1024;
+        }
+#ifdef __APPLE__
+        return u64{32} * 1024;
+#else
+        return VideoCore::BufferCache::STREAM_THRESHOLD;
+#endif
+    }();
+    return threshold;
+}
+
+} // Anonymous namespace
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -89,6 +114,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         LOG_INFO(Render_Vulkan, "Buffer arenas of {} MiB (driver buffer limit {} MiB)",
                  arena_page_size >> 20, instance.GetMaxBufferSize() >> 20);
     }
+#ifdef __APPLE__
+    std::printf("M1 UMA: buffer stream threshold %llu KiB (GOW3_UMA_STREAM_KB)\n",
+                static_cast<unsigned long long>(UmaStreamThreshold() >> 10));
+#endif
     if (dense_arenas) {
         block_size = MIN_BLOCK_SIZE;
     }
@@ -327,8 +356,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         PrintBufferStats();
         NoteHotUse(device_addr, size);
     }
-    // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    // For read-only buffers use unified/device-local stream buffer to avoid staging copies and
+    // renderpass breaks (M1 UMA extends this threshold via GOW3_UMA_STREAM_KB, default 32 KiB).
+    const u64 stream_limit = UmaStreamThreshold();
+    const bool use_uma_stream =
+        size > STREAM_THRESHOLD && size <= stream_limit && !stream_buffer.mapped_data.empty();
+    if (!is_written && (size <= STREAM_THRESHOLD || use_uma_stream) &&
+        !IsRegionGpuModified(device_addr, size)) {
+        if (use_uma_stream) {
+            Gow3Stats::uma_stream_hits.fetch_add(1, std::memory_order_relaxed);
+            Gow3Stats::uma_stream_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
         if (stats) {
             auto& region = Stats().regions[RegionKey(device_addr)];
             ++region.stream_count;

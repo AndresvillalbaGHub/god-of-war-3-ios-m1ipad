@@ -143,4 +143,7 @@ inline std::atomic<std::uint64_t> gpu_signal_faults{0};
 /// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
 inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
     protect_revoke_pages{0};
+/// gow3 (M1 Phase 4): UMA zero-staging stream hits (>16 KiB routed to unified stream_buffer)
+/// and BufferCopy calls that had to end an active TBDR render pass.
+inline std::atomic<std::uint64_t> uma_stream_hits{0}, uma_stream_bytes{0}, copy_pass_breaks{0};
 } // namespace Gow3Stats

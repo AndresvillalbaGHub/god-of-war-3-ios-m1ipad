@@ -834,6 +834,11 @@ public:
         return is_rendering && render_state == state;
     }
 
+    /// Whether any dynamic render pass is currently open.
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
     /// Whether BeginRendering(state) would start a new render pass.
     [[nodiscard]] bool WillBeginRendering(const RenderState& state) const {
         return !(is_rendering && render_state == state);

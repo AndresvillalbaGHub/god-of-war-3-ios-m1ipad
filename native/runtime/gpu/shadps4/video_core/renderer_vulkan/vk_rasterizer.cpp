@@ -1090,7 +1090,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
         camera_motion->SetJitter(upscaler->Jitter());
         object_motion->OnFrameStart();
-        NoteFrameStart();
+        if (regs.color_buffers[0].Address() != last_display_buffer) {
+            last_display_buffer = regs.color_buffers[0].Address();
+            NoteFrameStart();
+        }
         static const char* scene_debug = std::getenv("GOW3_SCENE_DEBUG");
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
@@ -4026,16 +4029,20 @@ void Rasterizer::NoteFrameStart() {
         if (now - last_log >= std::chrono::seconds(5)) {
             last_log = now;
             const auto st = m1_profile.ConsumeStats();
+            const u64 uma_hits = Gow3Stats::uma_stream_hits.exchange(0, std::memory_order_relaxed);
+            const u64 uma_bytes = Gow3Stats::uma_stream_bytes.exchange(0, std::memory_order_relaxed);
+            const u64 copy_breaks = Gow3Stats::copy_pass_breaks.exchange(0, std::memory_order_relaxed);
             if (st.frames > 0) {
                 const double f = double(st.frames);
                 std::printf("M1 TBDR/Profile (%llu frames, lvl %d, tbdr %d): skipped/frame "
                             "shad=%.1f mblur=%.1f bloom=%.1f refl=%.1f noop=%.1f | "
-                            "def_zclear=%.1f dont_care=%.1f\n",
+                            "def_zclear=%.1f dont_care=%.1f | uma_stream=%.1f (%.1f KB) copy_breaks=%.1f\n",
                             static_cast<unsigned long long>(st.frames),
                             Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed),
                             int(m1_profile.TbdrOptEnabled()), st.shadows / f, st.motion_blur / f,
                             st.bloom / f, st.reflections / f, st.noop / f, st.deferred_zclears / f,
-                            st.dont_care_loads / f);
+                            st.dont_care_loads / f, uma_hits / f, (uma_bytes / f) / 1024.0,
+                            copy_breaks / f);
             }
         }
     }

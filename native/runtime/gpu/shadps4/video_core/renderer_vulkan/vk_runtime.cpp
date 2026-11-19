@@ -114,6 +114,9 @@ void Runtime::TickFrame() {
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
+    if (scheduler.IsRendering()) {
+        Gow3Stats::copy_pass_breaks.fetch_add(1, std::memory_order_relaxed);
+    }
     scheduler.EndRendering();
 
     // gow3: many regions (HLE copy shaders) are tracked as one bounding range per buffer:

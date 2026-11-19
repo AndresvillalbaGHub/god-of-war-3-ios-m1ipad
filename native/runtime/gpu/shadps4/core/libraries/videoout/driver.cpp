@@ -15,6 +15,7 @@
 #include <sys/resource.h>
 #endif
 #include "common/assert.h"
+#include "gow3_threads.h"
 #include "gow3_toggles.h"
 #include "gow3_settings.h"
 #include "gow3_graphics.h"
@@ -101,6 +102,7 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
 
 void VideoOutDriver::SwapThread(std::stop_token token) {
     Common::SetCurrentThreadName("gow3:Present");
+    Gow3Threads::MakeInteractive();
     while (true) {
         std::function<void()> work;
         {

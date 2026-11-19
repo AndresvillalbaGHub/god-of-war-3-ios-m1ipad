@@ -16,6 +16,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <sys/qos.h>
 #elif defined(_WIN32)
 #include <windows.h>
 #include "common/string_util.h"
@@ -129,6 +130,27 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 
 #else
 
+#ifdef __APPLE__
+void SetCurrentThreadPriority(ThreadPriority new_priority) {
+    qos_class_t qos = QOS_CLASS_DEFAULT;
+    switch (new_priority) {
+    case ThreadPriority::Low:
+        qos = QOS_CLASS_UTILITY;
+        break;
+    case ThreadPriority::Normal:
+        qos = QOS_CLASS_DEFAULT;
+        break;
+    case ThreadPriority::High:
+        qos = QOS_CLASS_USER_INITIATED;
+        break;
+    case ThreadPriority::VeryHigh:
+    case ThreadPriority::Critical:
+        qos = QOS_CLASS_USER_INTERACTIVE;
+        break;
+    }
+    pthread_set_qos_class_self_np(qos, 0);
+}
+#else
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     pthread_t this_thread = pthread_self();
 
@@ -146,6 +168,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 
     pthread_setschedparam(this_thread, scheduling_type, &params);
 }
+#endif
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {

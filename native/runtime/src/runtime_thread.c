@@ -21,6 +21,9 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <sys/qos.h>
+#endif
 #if defined(__x86_64__)
 #include <asm/prctl.h>
 #endif
@@ -265,6 +268,13 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+#ifdef __APPLE__
+    /* Map PS4 thread priority (256=highest, 700=default, 767=lowest) to Darwin QoS so
+     * active game/driver threads stay on M1 P-cores and low-priority background guest
+     * workers (e.g. WorkerThread0 at prio=767) run on E-cores. */
+    pthread_set_qos_class_self_np(
+        t->attr.prio >= 750 ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0);
+#endif
 #ifdef GUEST_CPU_NATIVE
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
 #else

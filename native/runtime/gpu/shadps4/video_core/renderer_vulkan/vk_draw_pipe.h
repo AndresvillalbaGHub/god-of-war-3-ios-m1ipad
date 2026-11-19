@@ -110,8 +110,13 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = Gow3Cpu::Cycles();
+#ifdef __APPLE__
+        constexpr u32 kMaxSpins = 256;
+#else
+        constexpr u32 kMaxSpins = 4096;
+#endif
         for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
+            if (spins < kMaxSpins) {
                 Gow3Cpu::Pause();
             } else {
                 std::this_thread::yield();
@@ -151,13 +156,19 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
-        while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
-            Gow3Cpu::Pause();
+        for (u32 spins = 0; at + size - consumed.load(std::memory_order_acquire) > Capacity;
+             ++spins) {
+            if (spins < 256) {
+                Gow3Cpu::Pause();
+            } else {
+                std::this_thread::yield();
+            }
         }
     }
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("gow3:DrawRec");
+        Gow3Threads::MakeInteractive();
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
         u64 at = 0;
@@ -167,12 +178,17 @@ private:
             u64 available = published.load(std::memory_order_acquire);
             if (available == at) {
                 // With few hardware threads (Steam Deck: 8) a long spin takes time from the
-                // game's own threads. GOW3_PIPE_SPIN_US overrides.
+                // game's own threads. On Apple M1 keep spins tiny (5 us) to preserve thermal/P-core
+                // headroom. GOW3_PIPE_SPIN_US overrides.
                 static const auto spin_time = std::chrono::microseconds([] {
                     if (const char* env = std::getenv("GOW3_PIPE_SPIN_US")) {
                         return std::max(0, std::atoi(env));
                     }
+#ifdef __APPLE__
+                    return 5;
+#else
                     return Gow3Threads::Available() >= 12 ? 200 : 50;
+#endif
                 }());
                 const auto spin_until = std::chrono::steady_clock::now() + spin_time;
                 for (u32 spins = 1; available == at; ++spins) {

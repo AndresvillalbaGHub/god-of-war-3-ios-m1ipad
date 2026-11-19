@@ -382,12 +382,21 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("gow3:VkRecorder");
+    Gow3Threads::MakeInteractive();
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
-        // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
-        // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
-        static const auto spin_time = std::chrono::microseconds(
-            Gow3Threads::Available() >= 12 ? 200 : 20);
+        // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. On Apple M1
+        // keep spins tiny (5 us) to preserve thermal/P-core headroom.
+        static const auto spin_time = std::chrono::microseconds([] {
+            if (const char* env = std::getenv("GOW3_RECORDER_SPIN_US")) {
+                return std::max(0, std::atoi(env));
+            }
+#ifdef __APPLE__
+            return 5;
+#else
+            return Gow3Threads::Available() >= 12 ? 200 : 20;
+#endif
+        }());
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
         for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
             Gow3Cpu::Pause();
@@ -596,6 +605,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
+    Gow3Threads::MakeBackground();
 
     while (!stoken.stop_requested()) {
         PendingOp op;

@@ -186,6 +186,7 @@ private:
 
     void Loop(unsigned index) {
         Common::SetCurrentThreadName(("gow3:Copy" + std::to_string(index)).c_str());
+        Gow3Threads::MakeInitiated();
         u64 seen = 0;
         std::unique_lock lk{mutex};
         while (true) {
