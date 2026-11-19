@@ -24,7 +24,7 @@ Pod::Spec.new do |s|
   # The Rust pairing library draws randomness from Security; MoltenVK (in libgow3core_all.a) needs
   # Metal, QuartzCore (CAMetalLayer), IOSurface and CoreGraphics; the GPU library ImageIO (save
   # pictures); SDL3 the rest (audio, gamepads, haptics, sensors, its unused UIKit video driver).
-  s.frameworks = 'Security', 'Metal', 'QuartzCore', 'IOSurface', 'CoreGraphics', 'ImageIO',
+  s.frameworks = 'Security', 'Metal', 'MetalFX', 'QuartzCore', 'IOSurface', 'CoreGraphics', 'ImageIO',
                  'AVFoundation', 'AudioToolbox', 'CoreAudio', 'CoreBluetooth', 'CoreHaptics',
                  'CoreMotion', 'GameController', 'UIKit', 'Foundation', 'UniformTypeIdentifiers'
   # StikJIT's universal script (MPL-2.0), sent to StikDebug when enabling JIT, and the licences of

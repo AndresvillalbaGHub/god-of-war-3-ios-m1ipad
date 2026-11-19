@@ -467,6 +467,12 @@ void PerformanceTab() {
         static constexpr int m1_values[] = {0, 1, 2};
         ChoiceRow("M1 TBDR profile", s.m1_profile, m1_labels, m1_values, 3,
                   "Trims heavy secondary passes on Apple Silicon (shadows, bloom, motion blur, reflections). Live.");
+        static const char* const m1_drs_labels[] = {"Off", "Auto (M1)", "Aggressive (M1)"};
+        static constexpr int m1_drs_values[] = {0, 1, 2};
+        ChoiceRow("M1 Dynamic resolution", s.m1_dynres, m1_drs_labels, m1_drs_values, 3,
+                  "Lowers internal 3D resolution in heavy combat (540p -> 450p/432p/396p) while keeping UI and exposure native. Live.");
+        CheckRow("MetalFX Spatial upscaling", s.metalfx_spatial,
+                 "Native Apple Silicon MetalFX spatial upscaling from guest resolution to display size. Live.");
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Applied on restart");

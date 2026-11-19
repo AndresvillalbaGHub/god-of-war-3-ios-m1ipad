@@ -349,6 +349,9 @@ bool Instance::CreateDevice() {
         add_extension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     load_store_op_none = add_extension("VK_KHR_load_store_op_none");
+#ifdef __APPLE__
+    metal_objects = add_extension("VK_EXT_metal_objects");
+#endif
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =

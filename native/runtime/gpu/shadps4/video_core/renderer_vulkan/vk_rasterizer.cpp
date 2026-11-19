@@ -1147,6 +1147,19 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             ResetBindings(false);
             return;
         }
+        if (dctx.num_bound_colors == 0 && dctx.has_depth && dctx.depth_width >= 800 &&
+            dctx.depth_width <= 1920 && dctx.depth_height >= 450 && dctx.depth_height <= 1080 &&
+            dctx.depth_width != 2048) {
+            m1_dynres.ObserveBaseSize(dctx.depth_width, dctx.depth_height);
+            if (!m1_scene_ended && scene_targets->Reduced()) {
+                scene_started = true;
+            }
+        }
+        if (dctx.ps_hash32 == 0xd27a6203u || UiComposition::MovieShader(dctx.vs_hash32) ||
+            (scene_started && dctx.cb0_addr != 0 && FrameCapture::IsDisplayBuffer(dctx.cb0_addr))) {
+            m1_scene_ended = true;
+            scene_started = false;
+        }
         if (m1_profile.TbdrOptEnabled() && dctx.num_bound_colors == 0 && !dctx.has_depth &&
             dctx.ps_hash32 == 0 && !PipelineHasShaderWrites(pipeline)) {
             m1_profile.NoteNoop();
@@ -1155,10 +1168,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             return;
         }
         if (m1_profile.TbdrOptEnabled() && dctx.num_bound_colors == 0 && dctx.has_depth &&
-            dctx.ps_hash32 == 0 && dctx.depth_clear_enable && !scene_targets->Reduced() &&
-            !PipelineHasShaderWrites(pipeline)) {
+            dctx.ps_hash32 == 0 && dctx.depth_clear_enable && !PipelineHasShaderWrites(pipeline)) {
             auto& depth_img = texture_cache.GetImage(db_desc.first);
-            if (depth_img.info.resources.layers == 1 && depth_img.info.resources.levels == 1) {
+            if ((!scene_targets->Reduced() || !scene_targets->Eligible(depth_img)) &&
+                depth_img.info.resources.layers == 1 && depth_img.info.resources.levels == 1) {
                 scheduler.EndRendering();
                 begin_memo.valid = false;
                 texture_cache.UpdateImage(db_desc.first);
@@ -1176,6 +1189,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 return;
             }
         }
+        ++m1_frame_draws;
     }
     const PreparedDraw* draw_prepared = bind_prepared;
     // gow3: vertex and index buffers are resolved while the helper binds textures (their
@@ -2764,7 +2778,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     sig.num_samples = key.num_samples;
     sig.motion = key.motion_vectors;
     sig.scene_started = scene_started;
-    sig.raster_scaling = upscaler->RasterScaling();
+    sig.raster_scaling = upscaler->RasterScaling() || (scene_targets->Reduced() && !m1_scene_ended);
     sig.upscaler_state = upscaler->RedirectState();
     sig.generation = texture_cache.RegistryGeneration();
     std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(u32));
@@ -2936,7 +2950,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
     // A proxy attachment cannot represent MSAA or a feedback loop that reads the
     // same image through the guest's native descriptor during this draw.
-    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;
+    bool reduced = scene_started && (upscaler->RasterScaling() || scene_targets->Reduced()) &&
+                   key.num_samples == 1 && !m1_scene_ended;
     // GOW3_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
     const bool debug_pass = scene_debug_frame && scene_started;
@@ -2991,7 +3006,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         std::printf("Scene pass: reduced %d %s\n", reduced, why.c_str());
     }
-    push_data.scene_size = reduced ? SceneResolution::Pack(scene_targets->Size()) : 0;
+    push_data.scene_size = reduced ? scene_targets->PackedShaderSceneSize() : 0;
     if (Gow3Stats::enabled) {
         Gow3Stats::reduced_draws.fetch_add(reduced, std::memory_order_relaxed);
         Gow3Stats::scene_draws.fetch_add(scene_started, std::memory_order_relaxed);
@@ -3031,6 +3046,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                      : image->backing->state.layout;
         was_undefined[cb] = (prev_layout == vk::ImageLayout::eUndefined);
 
+        if (!reduced && is_clear) {
+            scene_targets->DiscardProxy(*image);
+        }
         if (reduced) {
             // The native image is resolved lazily when a shader/copy actually reads it.
         } else if (image->binding.is_bound) {
@@ -3067,7 +3085,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         attachment.is_clear = is_clear;
 
         if (reduced) {
-            const auto target = scene_targets->Attachment(image_id, desc.view_info);
+            const auto target = scene_targets->Attachment(image_id, desc.view_info, is_clear, false);
             attachment.image_view = target.view;
             attachment.image_layout = target.layout;
         }
@@ -3140,7 +3158,11 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                 ? (vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
                    vk::AccessFlagBits2::eDepthStencilAttachmentRead)
                 : vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+        const bool full_depth_clear = is_depth_clear && (!has_stencil || is_stencil_clear);
         if (!reduced) {
+            if (full_depth_clear) {
+                scene_targets->DiscardProxy(image);
+            }
             needs_barrier |= runtime.Transit(&image, new_layout,
                                              vk::PipelineStageFlagBits2::eEarlyFragmentTests |
                                                  vk::PipelineStageFlagBits2::eLateFragmentTests,
@@ -3172,7 +3194,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
 
         if (reduced) {
-            const auto target = scene_targets->Attachment(image_id, desc.view_info);
+            const bool depth_ro = !depth_write_layout && !stencil_write_layout;
+            const auto target =
+                scene_targets->Attachment(image_id, desc.view_info, full_depth_clear, depth_ro);
             attachment.image_view = target.view;
             attachment.image_layout = target.layout;
         }
@@ -3269,12 +3293,14 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
 
     if (reduced) {
-        // Half-resolution passes keep the scene's factor (proxy / native = scene / 1920).
+        // Half-resolution passes keep the scene's factor (proxy / base).
         const auto size = scene_targets->Size();
+        const auto base = scene_targets->BaseSize();
         const auto proxy = pass_size.value_or(size);
         state.width = proxy.width;
         state.height = proxy.height;
-        target_scale = {float(size.width) / 1920.0f, float(size.height) / 1080.0f};
+        target_scale = {float(size.width) / float(base.width),
+                        float(size.height) / float(base.height)};
     }
     if (m1_profile.TbdrOptEnabled() && !reduced && !color_redirected &&
         state.num_color_attachments > 0) {
@@ -4015,27 +4041,54 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
 }
 
 void Rasterizer::NoteFrameStart() {
+    scene_started = false;
+    m1_scene_ended = false;
     m1_profile.OnFrameStart(Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed));
+    const auto now = std::chrono::steady_clock::now();
+    static const auto t0 = now;
+    double frame_ms = 33.3;
+    if (m1_frame_start.time_since_epoch().count() != 0) {
+        frame_ms = std::chrono::duration<double, std::milli>(now - m1_frame_start).count();
+    }
+    m1_frame_start = now;
+    const double elapsed_s = std::chrono::duration<double>(now - t0).count();
+    const auto target_size = m1_dynres.OnFrameBoundary(
+        m1_frame_draws, frame_ms, elapsed_s,
+        Gow3Settings::Get().m1_dynres.load(std::memory_order_relaxed));
+    m1_frame_draws = 0;
+    if (!upscaler->RasterScaling() && m1_dynres.HasBase()) {
+        scene_targets->SetBaseSize(m1_dynres.BaseSize());
+        if (scene_targets->SetSize(target_size)) {
+            begin_memo.valid = false;
+        }
+    }
     static const bool m1_frame_stats = [] {
         const char* v = std::getenv("GOW3_FRAME_STATS");
         return v && v[0] == '1';
     }();
     if (m1_frame_stats) {
-        static auto last_log = std::chrono::steady_clock::now();
-        const auto now = std::chrono::steady_clock::now();
+        static auto last_log = now;
         if (now - last_log >= std::chrono::seconds(5)) {
             last_log = now;
             const auto st = m1_profile.ConsumeStats();
+            const auto xs = scene_targets->ConsumeTransferStats();
+            const u64 drs_chg = m1_dynres.ConsumeTierChanges();
             if (st.frames > 0) {
                 const double f = double(st.frames);
+                const auto drs_base = m1_dynres.BaseSize();
+                const auto drs_cur =
+                    scene_targets->Reduced() ? scene_targets->Size() : drs_base;
                 std::printf("M1 TBDR/Profile (%llu frames, lvl %d, tbdr %d): skipped/frame "
                             "shad=%.1f mblur=%.1f bloom=%.1f refl=%.1f noop=%.1f | "
-                            "def_zclear=%.1f dont_care=%.1f\n",
+                            "def_zclear=%.1f dont_care=%.1f | "
+                            "drs=%ux%u/%ux%u (t%d res=%.1f fill=%.1f chg=%llu)\n",
                             static_cast<unsigned long long>(st.frames),
                             Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed),
                             int(m1_profile.TbdrOptEnabled()), st.shadows / f, st.motion_blur / f,
                             st.bloom / f, st.reflections / f, st.noop / f, st.deferred_zclears / f,
-                            st.dont_care_loads / f);
+                            st.dont_care_loads / f, drs_cur.width, drs_cur.height, drs_base.width,
+                            drs_base.height, m1_dynres.Tier(), xs.resolves / f, xs.fills / f,
+                            static_cast<unsigned long long>(drs_chg));
             }
         }
     }

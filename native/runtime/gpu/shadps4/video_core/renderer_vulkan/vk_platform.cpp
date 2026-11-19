@@ -430,6 +430,19 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
             .pSettings = layer_setings.data(),
         },
     };
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+    VkExportMetalObjectCreateInfoEXT export_mtl_queue{
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_COMMAND_QUEUE_BIT_EXT,
+    };
+    VkExportMetalObjectCreateInfoEXT export_mtl_device{
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+        .pNext = &export_mtl_queue,
+        .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_DEVICE_BIT_EXT,
+    };
+    instance_ci_chain.get<vk::LayerSettingsCreateInfoEXT>().pNext = &export_mtl_device;
+#endif
 
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",

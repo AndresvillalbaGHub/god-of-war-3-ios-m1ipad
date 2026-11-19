@@ -318,6 +318,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     }
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    metalfx_pass.Create(instance, num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     Gow3Overlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
 
@@ -363,6 +364,7 @@ Presenter::~Presenter() {
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+    metalfx_pass.Destroy();
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -588,7 +590,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    auto cmdbuf = draw_scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -601,7 +603,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     vk::ImageView image_view{};
     vk::Extent2D image_size{};
+    vk::Image src_vk_image{};
     if (upscaled) {
+        src_vk_image = display.image;
         const auto device = instance.GetDevice();
         image_view = Check(device.createImageView({
             .image = display.image,
@@ -626,6 +630,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
     } else {
         auto& image = texture_cache.GetImage(image_id);
+        src_vk_image = image.GetImage();
         if (frame_dump) {
             runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
                             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
@@ -643,28 +648,49 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
-    // gow3: FSR 1, RCAS and its strength come from the in-game menu, every frame.
+    // gow3: MetalFX Spatial (iOS/M1) or FSR 1/RCAS from the in-game menu, every frame.
     const auto& graphics = Gow3Settings::Get();
     fsr_settings.enable = graphics.fsr1;
     fsr_settings.use_rcas = graphics.rcas;
     fsr_settings.rcas_attenuation = Gow3Graphics::RcasAttenuation(graphics.rcas_strength);
-    Gow3Settings::Get().image_width = int(image_size.width);
-    Gow3Settings::Get().image_height = int(image_size.height);
+    const vk::Extent2D guest_size = image_size;
+    Gow3Settings::Get().image_width = int(guest_size.width);
+    Gow3Settings::Get().image_height = int(guest_size.height);
     Gow3Settings::Get().window_width = int(frame->width);
     Gow3Settings::Get().window_height = int(frame->height);
-    Gow3Settings::Get().rcas_applied =
-        fsr_settings.use_rcas &&
-        Gow3Graphics::FsrPassRuns(fsr_settings.enable, true, int(image_size.width), int(image_size.height),
-                                  int(frame->width), int(frame->height));
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+    bool metalfx_ran = false;
+    if (graphics.metalfx_spatial && metalfx_pass.Available() && !frame->is_hdr &&
+        frame->width > image_size.width && frame->height > image_size.height) {
+        const bool perceptual_srgb = (view_info.format == vk::Format::eR8G8B8A8Srgb);
+        const vk::ImageView mfx_view = metalfx_pass.Render(
+            draw_scheduler, src_vk_image, view_info.format,
+            vk::ImageLayout::eShaderReadOnlyOptimal, image_size,
+            {frame->width, frame->height}, frame->is_hdr, perceptual_srgb);
+        cmdbuf = draw_scheduler.CommandBuffer();
+        if (mfx_view) {
+            image_view = mfx_view;
+            image_size = {frame->width, frame->height};
+            metalfx_ran = true;
+        }
+    }
+    if (metalfx_ran) {
+        Gow3Settings::Get().rcas_applied = false;
+    } else {
+        Gow3Settings::Get().rcas_applied =
+            fsr_settings.use_rcas &&
+            Gow3Graphics::FsrPassRuns(fsr_settings.enable, true, int(image_size.width),
+                                      int(image_size.height), int(frame->width),
+                                      int(frame->height));
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     // gow3: black bars around a cutscene when the render resolution is not 16:9 (movie_bars.h).
-    pp_settings.picture = MovieBars::Cutscenes().Bars(image_size.width, image_size.height,
+    pp_settings.picture = MovieBars::Cutscenes().Bars(guest_size.width, guest_size.height,
                                                       MovieBars::NowMs());
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     if (frame_dump) {

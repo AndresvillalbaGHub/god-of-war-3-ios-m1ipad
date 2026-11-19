@@ -71,9 +71,15 @@ struct Values {
     std::atomic<int> fps_limit{30};
     // gow3 (M1): 0=Off(Quality), 1=Balanced(M1), 2=Performance(M1). Live.
     std::atomic<int> m1_profile{1};
+    // gow3 (M1): 0=Off, 1=Auto(M1), 2=Aggressive(M1). Live.
+    std::atomic<int> m1_dynres{1};
+    // gow3 (M1): Native Apple MetalFX Spatial upscaler (guest -> display). Live.
+    std::atomic<bool> metalfx_spatial{true};
 #else
     std::atomic<int> fps_limit{0};
     std::atomic<int> m1_profile{0};
+    std::atomic<int> m1_dynres{0};
+    std::atomic<bool> metalfx_spatial{false};
 #endif
     std::atomic<bool> async_shaders{true};
     std::atomic<bool> fsr1{false};

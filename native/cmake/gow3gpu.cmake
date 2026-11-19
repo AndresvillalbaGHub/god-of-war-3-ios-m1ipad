@@ -56,6 +56,7 @@ add_custom_target(gow3gpu_host_shaders DEPENDS ${GOW3_SHADER_HEADERS})
 file(GLOB_RECURSE GOW3_VIDEO_CORE CONFIGURE_DEPENDS "${GOW3_GPU}/shadps4/video_core/*.cpp")
 file(GLOB_RECURSE GOW3_RECOMPILER CONFIGURE_DEPENDS "${GOW3_GPU}/shadps4/shader_recompiler/*.cpp")
 list(FILTER GOW3_VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
+list(FILTER GOW3_VIDEO_CORE EXCLUDE REGEX "metalfx_pass_stub\\.cpp$")
 file(GLOB GOW3_GPU_SHIM CONFIGURE_DEPENDS "${GOW3_GPU}/shim/*.cpp" "${GOW3_GPU}/shim/*/*.cpp")
 list(FILTER GOW3_GPU_SHIM EXCLUDE REGEX "/shim/window\\.cpp$")
 add_library(gow3gpu STATIC
@@ -83,6 +84,7 @@ add_library(gow3gpu STATIC
     "${GOW3_GPU}/third_party/imgui/backends/imgui_impl_vulkan.cpp"
     "${GOW3_GPU}/ios/ffx_stub.c"
     "${GOW3_GPU}/ios/avplayer_stub.cpp"
+    "${GOW3_GPU}/ios/metalfx_pass_ios.mm"
     "${GOW3_GPU}/ios/window_ios.mm")
 add_dependencies(gow3gpu gow3gpu_host_shaders)
 set_target_properties(gow3gpu PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
