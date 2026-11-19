@@ -4016,7 +4016,11 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
 
 void Rasterizer::NoteFrameStart() {
     m1_profile.OnFrameStart(Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed));
-    if (Gow3Stats::enabled) {
+    static const bool m1_frame_stats = [] {
+        const char* v = std::getenv("GOW3_FRAME_STATS");
+        return v && v[0] == '1';
+    }();
+    if (m1_frame_stats) {
         static auto last_log = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         if (now - last_log >= std::chrono::seconds(5)) {

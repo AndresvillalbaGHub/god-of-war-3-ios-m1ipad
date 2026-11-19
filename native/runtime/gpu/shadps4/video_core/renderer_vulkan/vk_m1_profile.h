@@ -77,7 +77,7 @@ struct M1ProfileConfig {
             cfg.reflections = true;
         } else if (level == 2) {
             cfg.shadow_limit = 2;
-            cfg.bloom = BloomMode::Off;
+            cfg.bloom = BloomMode::Lite;
             cfg.motion_blur = false;
             cfg.reflections = false;
         }
@@ -133,6 +133,7 @@ public:
         in_shadow_cascade = false;
         skip_current_shadow = false;
         seen_main_depth = false;
+        reflection_target = 0;
         ++stats.frames;
     }
 
@@ -160,8 +161,9 @@ public:
             motion_blur_target = ctx.cb0_addr;
         }
         if (!seen_main_depth && ctx.num_bound_colors == 1 && ctx.vs_hash32 == kClearVs &&
-            ctx.ps_hash32 == kClearPs && ctx.cb0_addr && ctx.cb0_unorm8 && ctx.cb0_width <= 960 &&
-            ctx.cb0_height <= 540) {
+            ctx.ps_hash32 == kClearPs && ctx.cb0_addr && ctx.cb0_unorm8 && ctx.has_depth &&
+            ctx.depth_clear_enable && ctx.depth_width == ctx.cb0_width &&
+            ctx.depth_height == ctx.cb0_height && ctx.cb0_width <= 640 && ctx.cb0_height <= 360) {
             reflection_target = ctx.cb0_addr;
         }
 
@@ -219,9 +221,11 @@ public:
             }
         }
 
-        // Half-resolution planar reflection render passes (keep initial clear draw intact).
-        if (!cfg.reflections && reflection_target != 0 && ctx.cb0_addr == reflection_target &&
-            ctx.cb0_unorm8 && ctx.vs_hash32 != kClearVs) {
+        // Half-resolution planar reflection render passes (keep initial clear draw and UI intact).
+        if (!cfg.reflections && !seen_main_depth && reflection_target != 0 &&
+            ctx.cb0_addr == reflection_target && ctx.cb0_unorm8 && ctx.has_depth &&
+            ctx.depth_width == ctx.cb0_width && ctx.depth_height == ctx.cb0_height &&
+            ctx.vs_hash32 != kClearVs && !IsUiMovieVs(ctx.vs_hash32)) {
             ++stats.reflections;
             return true;
         }
@@ -252,6 +256,11 @@ private:
 
     static constexpr bool IsBloomBaseOrCompositePs(u32 ps) noexcept {
         return ps == 0x0439fa1bu || ps == 0xcecf26ddu || ps == 0xf9812259u || ps == 0xc9e7c40cu;
+    }
+
+    static constexpr bool IsUiMovieVs(u32 vs) noexcept {
+        return vs == 0x34e8a281u || vs == 0x81d336ceu || vs == 0x09957251u ||
+               vs == 0x24042a9bu || vs == 0xa400228bu;
     }
 
     M1ProfileConfig cfg{};
