@@ -60,6 +60,29 @@ void* CreateScaler(void* mtl_device, std::uint32_t in_w, std::uint32_t in_h,
     }
 }
 
+bool ValidateTextures(void* scaler_ptr, void* src_tex, void* dst_tex) {
+    if (!scaler_ptr || !src_tex || !dst_tex) {
+        return false;
+    }
+    @autoreleasepool {
+        id<MTLFXSpatialScaler> scaler = (__bridge id<MTLFXSpatialScaler>)scaler_ptr;
+        id<MTLTexture> src = (__bridge id<MTLTexture>)src_tex;
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)dst_tex;
+        const MTLTextureUsage req_in = scaler.colorTextureUsage;
+        const MTLTextureUsage req_out = scaler.outputTextureUsage;
+        if ((src.usage & req_in) != req_in || (dst.usage & req_out) != req_out ||
+            dst.storageMode != MTLStorageModePrivate) {
+            std::printf("MetalFX Spatial: incompatible texture usage/storage "
+                        "(src=0x%lx req=0x%lx, dst=0x%lx req=0x%lx, dst_storage=%lu)\n",
+                        static_cast<unsigned long>(src.usage), static_cast<unsigned long>(req_in),
+                        static_cast<unsigned long>(dst.usage), static_cast<unsigned long>(req_out),
+                        static_cast<unsigned long>(dst.storageMode));
+            return false;
+        }
+        return true;
+    }
+}
+
 bool Encode(void* mtl_queue, void* scaler_ptr, void* src_tex, void* dst_tex,
             std::uint32_t in_w, std::uint32_t in_h) {
     if (!mtl_queue || !scaler_ptr || !src_tex || !dst_tex) {

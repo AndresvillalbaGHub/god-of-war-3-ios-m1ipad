@@ -25,6 +25,7 @@ void ReleaseObject(void* retained);
 bool SupportsDevice(void* mtl_device, char* name_buf, std::size_t name_size);
 void* CreateScaler(void* mtl_device, std::uint32_t in_w, std::uint32_t in_h,
                    std::uint32_t out_w, std::uint32_t out_h, bool perceptual_srgb);
+bool ValidateTextures(void* scaler_ptr, void* src_tex, void* dst_tex);
 bool Encode(void* mtl_queue, void* scaler_ptr, void* src_tex, void* dst_tex,
             std::uint32_t in_w, std::uint32_t in_h);
 } // namespace Vulkan::HostPasses::MetalFXBridge
@@ -57,6 +58,7 @@ bool CreateExportableImage(VmaAllocator allocator, u32 width, u32 height, VkImag
     };
     const VmaAllocationCreateInfo alloc_ci{
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
     };
     return vmaCreateImage(allocator, &image_ci, &alloc_ci, &out_image, &out_alloc, nullptr) ==
            VK_SUCCESS;
@@ -127,17 +129,18 @@ struct MetalFXSpatialPass::Impl {
     bool cur_perceptual = true;
     bool available = false;
     bool active_last_frame = false;
+    bool failed_for_config = false;
     std::vector<Slot> slots;
 
     void DestroySlots() {
         for (auto& s : slots) {
             if (s.dst_view_srgb) {
                 vk_device.destroyImageView(s.dst_view_srgb);
-                s.dst_view_srgb = {};
+                s.dst_view_srgb = nullptr;
             }
             if (s.dst_view_unorm) {
                 vk_device.destroyImageView(s.dst_view_unorm);
-                s.dst_view_unorm = {};
+                s.dst_view_unorm = nullptr;
             }
             MetalFXBridge::ReleaseObject(s.src_mtl);
             s.src_mtl = nullptr;
@@ -145,12 +148,12 @@ struct MetalFXSpatialPass::Impl {
             s.dst_mtl = nullptr;
             if (s.src_image && allocator) {
                 vmaDestroyImage(allocator, static_cast<VkImage>(s.src_image), s.src_alloc);
-                s.src_image = {};
+                s.src_image = nullptr;
                 s.src_alloc = nullptr;
             }
             if (s.dst_image && allocator) {
                 vmaDestroyImage(allocator, static_cast<VkImage>(s.dst_image), s.dst_alloc);
-                s.dst_image = {};
+                s.dst_image = nullptr;
                 s.dst_alloc = nullptr;
             }
             s.dst_layout = vk::ImageLayout::eUndefined;
@@ -160,10 +163,22 @@ struct MetalFXSpatialPass::Impl {
 
     bool EnsureResources(Scheduler& scheduler, vk::Extent2D in_sz, vk::Extent2D out_sz,
                          bool perceptual_srgb) {
-        if (scaler && cur_in == in_sz && cur_out == out_sz &&
-            cur_perceptual == perceptual_srgb && !slots.empty()) {
-            return true;
+        if (cur_in == in_sz && cur_out == out_sz && cur_perceptual == perceptual_srgb) {
+            if (scaler && !slots.empty()) {
+                return true;
+            }
+            if (failed_for_config) {
+                return false;
+            }
         }
+        auto mark_failed = [&] {
+            cur_in = in_sz;
+            cur_out = out_sz;
+            cur_perceptual = perceptual_srgb;
+            failed_for_config = true;
+            return false;
+        };
+        failed_for_config = false;
         scheduler.Finish();
         MetalFXBridge::ReleaseObject(scaler);
         scaler = nullptr;
@@ -174,7 +189,7 @@ struct MetalFXSpatialPass::Impl {
         if (!scaler) {
             std::printf("MetalFX Spatial: newSpatialScalerWithDevice returned nil (%ux%u -> %ux%u)\n",
                         in_sz.width, in_sz.height, out_sz.width, out_sz.height);
-            return false;
+            return mark_failed();
         }
 
         const u32 count = std::max(1u, num_images);
@@ -182,11 +197,17 @@ struct MetalFXSpatialPass::Impl {
         for (u32 i = 0; i < count; ++i) {
             auto& s = slots[i];
             VkImage src_raw = VK_NULL_HANDLE;
-            VkImage dst_raw = VK_NULL_HANDLE;
             if (!CreateExportableImage(allocator, in_sz.width, in_sz.height,
                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                                       src_raw, s.src_alloc) ||
-                !CreateExportableImage(
+                                       src_raw, s.src_alloc)) {
+                DestroySlots();
+                MetalFXBridge::ReleaseObject(scaler);
+                scaler = nullptr;
+                return mark_failed();
+            }
+            s.src_image = vk::Image{src_raw};
+            VkImage dst_raw = VK_NULL_HANDLE;
+            if (!CreateExportableImage(
                     allocator, out_sz.width, out_sz.height,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -194,20 +215,22 @@ struct MetalFXSpatialPass::Impl {
                 DestroySlots();
                 MetalFXBridge::ReleaseObject(scaler);
                 scaler = nullptr;
-                return false;
+                return mark_failed();
             }
-            s.src_image = vk::Image{src_raw};
             s.dst_image = vk::Image{dst_raw};
             s.src_mtl = MetalFXBridge::RetainObject(
                 ExportTexture(static_cast<VkDevice>(vk_device), export_fn, src_raw));
             s.dst_mtl = MetalFXBridge::RetainObject(
                 ExportTexture(static_cast<VkDevice>(vk_device), export_fn, dst_raw));
-            if (!s.src_mtl || !s.dst_mtl) {
-                std::printf("MetalFX Spatial: failed exporting MTLTexture from VkImage\n");
+            if (!s.src_mtl || !s.dst_mtl ||
+                !MetalFXBridge::ValidateTextures(scaler, s.src_mtl, s.dst_mtl)) {
+                if (!s.src_mtl || !s.dst_mtl) {
+                    std::printf("MetalFX Spatial: failed exporting MTLTexture from VkImage\n");
+                }
                 DestroySlots();
                 MetalFXBridge::ReleaseObject(scaler);
                 scaler = nullptr;
-                return false;
+                return mark_failed();
             }
             s.dst_view_srgb = CreateColorView(vk_device, s.dst_image, vk::Format::eR8G8B8A8Srgb);
             s.dst_view_unorm = CreateColorView(vk_device, s.dst_image, vk::Format::eR8G8B8A8Unorm);
@@ -301,12 +324,13 @@ void MetalFXSpatialPass::Destroy() {
     MetalFXBridge::ReleaseObject(impl->mtl_device);
     impl->mtl_device = nullptr;
     impl->export_fn = nullptr;
-    impl->vk_device = {};
+    impl->vk_device = nullptr;
     impl->allocator = nullptr;
     impl->cur_in = {};
     impl->cur_out = {};
     impl->available = false;
     impl->active_last_frame = false;
+    impl->failed_for_config = false;
 }
 
 bool MetalFXSpatialPass::Available() const noexcept {
