@@ -14,6 +14,11 @@
 #include <pthread.h>
 #include <time.h>
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+extern int gow3_is_suspended(void);
+#else
+static inline int gow3_is_suspended(void) { return 0; }
+#endif
 
 #define PORTS 25
 #define ERR_NOT_OPENED ((int32_t)0x80260001)
@@ -180,6 +185,17 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     pthread_mutex_unlock(&table_lock);
     if (!p) return error;
     pthread_mutex_lock(&p->lock);
+#ifdef __APPLE__
+    if (gow3_is_suspended()) {
+        if (p->stream) SDL_PauseAudioStreamDevice(p->stream);
+        while (gow3_is_suspended()) {
+            struct timespec ts = {0, 30000000L};
+            nanosleep(&ts, NULL);
+        }
+        if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
+        p->next_deadline_ns = 0;
+    }
+#endif
     size_t samples=(size_t)p->frames*(size_t)p->channels, bytes=samples*(size_t)p->sample_bytes;
     uint64_t period=(uint64_t)p->frames*1000000000u/48000u;
     if (data) {

@@ -20,6 +20,15 @@ int gow3_probe_main(int argc, char **argv);
 
 /* Flips the game submitted (VideoOutDriver::SubmitFlip); the watchdog below watches it. */
 unsigned long long gow3_flip_count;
+static int game_suspended;
+
+void gow3_set_suspended(int suspended) {
+    __atomic_store_n(&game_suspended, suspended ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+int gow3_is_suspended(void) {
+    return __atomic_load_n(&game_suspended, __ATOMIC_ACQUIRE);
+}
 #ifdef __APPLE__
 /* probe.c: faults that reached its handler, the last one, and where the game image is. */
 extern unsigned long long gow3_fault_count;
@@ -85,6 +94,12 @@ static void *frame_watchdog(void *unused) {
     int stalled = 0, dumped = 0;
     for (;;) {
         sleep(TICK);
+        if (gow3_is_suspended()) {
+            stalled = 0;
+            dumped = 0;
+            last_flips = __atomic_load_n(&gow3_flip_count, __ATOMIC_RELAXED);
+            continue;
+        }
         stalled += TICK;
         const unsigned long long flips = __atomic_load_n(&gow3_flip_count, __ATOMIC_RELAXED);
         if (flips != last_flips) { last_flips = flips; stalled = 0; dumped = 0; }

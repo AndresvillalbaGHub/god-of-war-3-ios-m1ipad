@@ -1,8 +1,8 @@
 import { StatusBar } from 'expo-status-bar';
 import { type ReactNode, useCallback, useEffect, useState } from 'react';
-import { AppState, Image, type ImageSourcePropType, Pressable, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
+import { Alert, AppState, Image, type ImageSourcePropType, Pressable, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
 
-import Gow3Core from './modules/gow3-core/src/Gow3CoreModule';
+import Gow3Core, { type SaveSummary } from './modules/gow3-core/src/Gow3CoreModule';
 
 const APP_NAME = 'Olympus';
 const GAME_TITLE = 'God of War III Remastered';
@@ -15,10 +15,29 @@ type Tab = 'home' | 'setup' | 'system';
 
 // controllers() is new in the native build after 4ed13b6; older installed IPAs lack it.
 const listControllers = () => (typeof Gow3Core.controllers === 'function' ? Gow3Core.controllers() : []);
-// The on-screen controls switch is new in 0.1.44, the FPS cap in 0.1.45; older installed IPAs lack them.
+// Optional native capabilities for backwards compatibility with older installed IPAs.
 const hasTouchControls = typeof Gow3Core.touchControlsEnabled === 'function';
 const hasFpsLimit = typeof Gow3Core.fpsLimit === 'function';
+const hasM1Profile = typeof Gow3Core.m1Profile === 'function';
+const hasResume = typeof Gow3Core.resumeGame === 'function';
+const hasSaveManager = typeof Gow3Core.saveSummary === 'function';
 const FPS_LIMITS = [20, 24, 30, 40, 60, 0];
+const M1_PROFILES = ['Off', 'Balanced', 'Performance', 'Ultra'];
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatDate(ms: number): string {
+  if (!ms) return '';
+  try {
+    return new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
 
 const color = {
   bg: '#07070a',
@@ -151,7 +170,9 @@ export default function App() {
   const [gameLog, setGameLog] = useState(() => Gow3Core.readGameLog());
   const [gpuReport, setGpuReport] = useState('');
   const [fpsLimit, setFpsLimit] = useState(() => (hasFpsLimit ? Gow3Core.fpsLimit() : 30));
+  const [m1Profile, setM1Profile] = useState(() => (hasM1Profile ? Gow3Core.m1Profile() : 1));
   const [touchControls, setTouchControls] = useState(() => (hasTouchControls ? Gow3Core.touchControlsEnabled() : false));
+  const [saves, setSaves] = useState<SaveSummary | null>(() => (hasSaveManager ? Gow3Core.saveSummary() : null));
   const [coverFailed, setCoverFailed] = useState(false);
 
   const refresh = useCallback(() => {
@@ -162,19 +183,33 @@ export default function App() {
     Gow3Core.pairingState().then(setPairing, () => setPairing(null));
     setFiles(Gow3Core.gameFiles());
     setGameLog(Gow3Core.readGameLog());
+    if (hasFpsLimit) setFpsLimit(Gow3Core.fpsLimit());
+    if (hasM1Profile) setM1Profile(Gow3Core.m1Profile());
+    if (hasTouchControls) setTouchControls(Gow3Core.touchControlsEnabled());
+    if (hasSaveManager) setSaves(Gow3Core.saveSummary());
   }, []);
 
   useEffect(() => {
     refresh();
     // Pairing happens in Settings: refresh when the app comes back.
     const sub = AppState.addEventListener('change', (state) => state === 'active' && refresh());
-    return () => sub.remove();
+    const sessionSub =
+      typeof Gow3Core.addListener === 'function'
+        ? Gow3Core.addListener('onSessionStateChanged', () => refresh())
+        : null;
+    return () => {
+      sub.remove();
+      sessionSub?.remove();
+    };
   }, [refresh]);
 
-  // While the game runs, follow its log.
+  // While the game runs or is suspended, keep its log and session state fresh.
   useEffect(() => {
     if (!files.started) return;
-    const timer = setInterval(() => setGameLog(Gow3Core.readGameLog()), 1000);
+    const timer = setInterval(() => {
+      setFiles(Gow3Core.gameFiles());
+      setGameLog(Gow3Core.readGameLog());
+    }, 1000);
     return () => clearInterval(timer);
   }, [files.started]);
 
@@ -247,7 +282,14 @@ export default function App() {
 
   let play: { title: string; onPress: () => void; disabled: boolean; hint: string };
   if (files.started) {
-    play = { title: 'Running', onPress: () => {}, disabled: true, hint: 'In game. A two-finger double tap there brings you back here.' };
+    play = hasResume
+      ? {
+          title: 'Resume',
+          onPress: () => run(() => Gow3Core.resumeGame()),
+          disabled: busy,
+          hint: 'Session suspended · JIT ready. Tap Resume to return to the pause menu.',
+        }
+      : { title: 'Running', onPress: () => {}, disabled: true, hint: 'In game. A two-finger double tap there brings you back here.' };
   } else if (!filesReady) {
     play = { title: 'Add game files', onPress: () => setTab('setup'), disabled: false, hint: `Copy your own dump in with the Files app (${APP_NAME} › gow3).` };
   } else if (!jit) {
@@ -270,6 +312,30 @@ export default function App() {
     const next = FPS_LIMITS[(FPS_LIMITS.indexOf(fpsLimit) + 1) % FPS_LIMITS.length];
     Gow3Core.setFpsLimit(next);
     setFpsLimit(next);
+  };
+
+  const cycleM1Profile = () => {
+    const next = (m1Profile + 1) % M1_PROFILES.length;
+    Gow3Core.setM1Profile(next);
+    setM1Profile(next);
+  };
+
+  const confirmRestoreBackup = (name: string) => {
+    Alert.alert(
+      'Restore save backup?',
+      `Replace current saves with "${name}"? A safety copy of your current saves will be kept automatically.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Restore', onPress: () => run(() => Gow3Core.restoreSaveBackup(name)) },
+      ]
+    );
+  };
+
+  const confirmDeleteBackup = (name: string) => {
+    Alert.alert('Delete backup?', `Remove local backup "${name}" permanently?`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: () => run(() => Gow3Core.deleteSaveBackup(name)) },
+    ]);
   };
 
   return (
@@ -303,6 +369,7 @@ export default function App() {
                 <View style={styles.pills}>
                   <Pill label={jit ? 'JIT ready' : 'JIT needed'} good={jit} />
                   <Pill label={filesReady ? 'Installed' : `${missing} missing`} good={filesReady} />
+                  {files.started ? <Pill label={files.suspended ? 'Suspended' : 'Running'} good /> : null}
                 </View>
               </View>
             </View>
@@ -318,44 +385,145 @@ export default function App() {
             <Text style={styles.hint}>{status || play.hint}</Text>
 
             <Text style={styles.section}>Quick settings</Text>
-            <View style={styles.quickRow}>
-              {hasFpsLimit ? (
+            <View style={styles.quickGrid}>
+              <View style={styles.quickRow}>
+                {hasFpsLimit ? (
+                  <QuickTile
+                    title="FRAME CAP"
+                    value={fpsLimit ? `${fpsLimit} FPS` : 'Off'}
+                    detail={
+                      files.started
+                        ? 'Live · Tap to change'
+                        : fpsLimit > 0 && fpsLimit <= 40
+                          ? 'Steady, cooler'
+                          : 'Tap to change'
+                    }
+                    onPress={cycleFps}
+                    active={fpsLimit > 0 && fpsLimit <= 40}
+                  />
+                ) : null}
+                {hasM1Profile ? (
+                  <QuickTile
+                    title="M1 PROFILE"
+                    value={M1_PROFILES[m1Profile] ?? 'Balanced'}
+                    detail={files.started ? 'Live · Tap to cycle' : 'M1 TBDR preset'}
+                    onPress={cycleM1Profile}
+                    active={m1Profile > 0}
+                  />
+                ) : null}
+              </View>
+              <View style={styles.quickRow}>
+                {hasTouchControls ? (
+                  <QuickTile
+                    title="TOUCH"
+                    value={touchControls ? 'On' : 'Off'}
+                    detail="Hold Hide in game to edit"
+                    onPress={() => {
+                      Gow3Core.setTouchControlsEnabled(!touchControls);
+                      setTouchControls(!touchControls);
+                    }}
+                    active={touchControls}
+                  />
+                ) : null}
                 <QuickTile
-                  title="FRAME CAP"
-                  value={fpsLimit ? `${fpsLimit} FPS` : 'Off'}
-                  detail={
-                    files.started ? 'Next start' : fpsLimit > 0 && fpsLimit <= 40 ? 'Steady, cooler' : 'Tap to change'
-                  }
-                  onPress={cycleFps}
-                  active={fpsLimit > 0 && fpsLimit <= 40}
+                  title="CONTROLLER"
+                  value={pad ? pad.name : 'None'}
+                  detail={pad ? (pad.battery >= 0 ? `${Math.round(pad.battery * 100)}% battery` : pad.kind) : 'Pair in Bluetooth'}
+                  onPress={refresh}
+                  active={!!pad}
                 />
-              ) : null}
-              {hasTouchControls ? (
-                <QuickTile
-                  title="TOUCH"
-                  value={touchControls ? 'On' : 'Off'}
-                  detail="Hold Hide in game to edit"
-                  onPress={() => {
-                    Gow3Core.setTouchControlsEnabled(!touchControls);
-                    setTouchControls(!touchControls);
-                  }}
-                  active={touchControls}
-                />
-              ) : null}
-              <QuickTile
-                title="CONTROLLER"
-                value={pad ? pad.name : 'None'}
-                detail={pad ? (pad.battery >= 0 ? `${Math.round(pad.battery * 100)}% battery` : pad.kind) : 'Pair in Bluetooth'}
-                onPress={refresh}
-                active={!!pad}
-              />
+              </View>
             </View>
+
+            {hasSaveManager ? (
+              <>
+                <Text style={styles.section}>Save data</Text>
+                <Panel
+                  title="Saved games"
+                  subtitle={
+                    saves?.hasSaves
+                      ? `${saves.fileCount} file${saves.fileCount === 1 ? '' : 's'} · ${formatBytes(saves.totalBytes)}`
+                      : 'No local save files yet'
+                  }
+                >
+                  <View style={styles.row}>
+                    <Button
+                      title="Backup"
+                      onPress={() =>
+                        run(async () => {
+                          const created = await Gow3Core.createSaveBackup('');
+                          return `Saved backup "${created.name}".`;
+                        })
+                      }
+                      disabled={busy || !saves?.hasSaves}
+                    />
+                    <Button
+                      title="Export .zip"
+                      onPress={() => run(() => Gow3Core.exportSaves())}
+                      disabled={busy || !saves?.hasSaves}
+                    />
+                    <Button
+                      title="Import"
+                      onPress={() => run(() => Gow3Core.importSaves())}
+                      disabled={busy || files.started}
+                    />
+                  </View>
+                  {files.started ? (
+                    <Text style={styles.warn}>
+                      Backup and Export work anytime. Relaunch the app before restoring or importing saves.
+                    </Text>
+                  ) : null}
+                  {saves && saves.backups.length > 0 ? (
+                    <View style={styles.backupList}>
+                      {saves.backups.map((b) => (
+                        <View key={b.name} style={styles.backupRow}>
+                          <View style={styles.backupMeta}>
+                            <Text style={styles.backupName} numberOfLines={1}>
+                              {b.name}
+                            </Text>
+                            <Text style={styles.backupDetail} numberOfLines={1}>
+                              {`${formatDate(b.createdAt)} · ${b.fileCount} files · ${formatBytes(b.totalBytes)}`}
+                            </Text>
+                          </View>
+                          <View style={styles.backupActions}>
+                            <Pressable
+                              onPress={() => confirmRestoreBackup(b.name)}
+                              disabled={busy || files.started}
+                              style={({ pressed }) => [
+                                styles.miniBtn,
+                                pressed && styles.pressed,
+                                (busy || files.started) && styles.disabled,
+                              ]}
+                            >
+                              <Text style={styles.miniBtnText}>Restore</Text>
+                            </Pressable>
+                            <Pressable
+                              onPress={() => confirmDeleteBackup(b.name)}
+                              disabled={busy}
+                              style={({ pressed }) => [
+                                styles.miniBtn,
+                                styles.miniBtnQuiet,
+                                pressed && styles.pressed,
+                                busy && styles.disabled,
+                              ]}
+                            >
+                              <Text style={styles.miniBtnText}>Delete</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                      ))}
+                    </View>
+                  ) : null}
+                </Panel>
+              </>
+            ) : null}
 
             <Text style={styles.section}>Tips</Text>
             <View style={styles.panel}>
               <Text style={styles.body}>• Menu (touch) or R3 + L2 opens the settings and cheats menu in game.</Text>
-              <Text style={styles.body}>• Two-finger double tap on an empty spot returns here; the game keeps running.</Text>
-              <Text style={styles.body}>• A 30 FPS cap keeps heavy fights steady and the phone cooler.</Text>
+              <Text style={styles.body}>• Select (touch) or controller Back/Share opens the Pause / Checkpoint menu.</Text>
+              <Text style={styles.body}>• Suspend (touch), two-finger double tap, or L3 + R2 pauses and returns here keeping JIT active.</Text>
+              <Text style={styles.body}>• A 20 or 24 FPS cap aligns with the iPad Pro 120 Hz screen cleanly.</Text>
             </View>
           </>
         ) : null}
@@ -534,6 +702,7 @@ const styles = StyleSheet.create({
   playText: { color: '#fff', fontSize: 22, fontWeight: '800', letterSpacing: 1.5 },
   hint: { color: color.muted, fontSize: 13, textAlign: 'center' },
   section: { color: color.faint, fontSize: 12, fontWeight: '700', letterSpacing: 2, textTransform: 'uppercase', marginTop: 12 },
+  quickGrid: { gap: 10 },
   quickRow: { flexDirection: 'row', gap: 10 },
   quick: { flex: 1, backgroundColor: color.panel, borderRadius: 16, borderWidth: 1, borderColor: color.border, padding: 12, gap: 4, minHeight: 104 },
   quickActive: { borderColor: 'rgba(212,65,47,0.6)' },
@@ -546,9 +715,18 @@ const styles = StyleSheet.create({
   panelBody: { gap: 12, marginTop: 6 },
   body: { color: color.muted, fontSize: 14, lineHeight: 20 },
   row: { flexDirection: 'row', gap: 10 },
-  button: { flex: 1, backgroundColor: color.raised, borderRadius: 12, paddingVertical: 13, alignItems: 'center', borderWidth: 1, borderColor: color.border },
+  button: { flex: 1, backgroundColor: color.raised, borderRadius: 12, paddingVertical: 13, paddingHorizontal: 8, alignItems: 'center', borderWidth: 1, borderColor: color.border },
   buttonQuiet: { backgroundColor: 'transparent' },
   buttonText: { color: color.text, fontWeight: '600', fontSize: 15 },
+  backupList: { gap: 8, marginTop: 4 },
+  backupRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 8, borderTopWidth: 1, borderTopColor: color.border },
+  backupMeta: { flex: 1, gap: 2 },
+  backupName: { color: color.text, fontFamily: 'Menlo', fontSize: 12, fontWeight: '600' },
+  backupDetail: { color: color.muted, fontSize: 11 },
+  backupActions: { flexDirection: 'row', gap: 6 },
+  miniBtn: { backgroundColor: color.raised, borderRadius: 9, paddingVertical: 7, paddingHorizontal: 11, borderWidth: 1, borderColor: color.border },
+  miniBtnQuiet: { backgroundColor: 'transparent' },
+  miniBtnText: { color: color.text, fontWeight: '600', fontSize: 12 },
   pressed: { opacity: 0.75, transform: [{ scale: 0.98 }] },
   disabled: { opacity: 0.4 },
   pairing: { gap: 8, padding: 14, borderRadius: 12, backgroundColor: color.raised },

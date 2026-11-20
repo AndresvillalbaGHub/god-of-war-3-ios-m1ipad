@@ -179,11 +179,9 @@ private:
         std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
         bool motion = false;
         bool scene_started = false;
-        bool m1_scene_ended = false;
         bool raster_scaling = false;
         u64 upscaler_state = 0;
         u64 generation = 0;
-        u64 scene_generation = 0;
         u32 depth_control = 0;
         bool depth_valid = false;
         bool stencil_valid = false;
@@ -335,8 +333,6 @@ private:
     std::unique_ptr<CameraMotion> camera_motion; // gow3: motion vectors (docs/upscaler.md)
     std::unique_ptr<SceneTargets> scene_targets;
     bool scene_started = false;
-    bool m1_scene_ended = false;
-    SceneResolution::Size m1_observed_base{0, 0};
     std::unique_ptr<ObjectMotion> object_motion;
     bool motion_draw = false;
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw

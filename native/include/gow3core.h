@@ -38,6 +38,21 @@ size_t gow3_gpu_screen_test(void *metal_layer, uint32_t width, uint32_t height, 
  * touchpad side, 0x20000000 opens or closes the settings menu) and the sticks (left x, left y, right x, right y in bytes 0-3, 128 centered). They add
  * to a connected controller's input. Call with (0, 0x80808080) to release everything. */
 void gow3_touch_pad(uint32_t buttons, uint32_t sticks);
+/* Queues a reliable right-touchpad click (Select / Pause menu) across upcoming pad polls. */
+void gow3_pad_trigger_select(void);
+
+/* Cleanly suspends or resumes the active iOS game session (parks GPU flips, audio and watchdog
+ * while preserving the process and JIT pool across launcher visits and app backgrounding). */
+void gow3_set_suspended(int suspended);
+int gow3_is_suspended(void);
+
+/* Registers a host callback invoked when the physical controller shortcut (L3 + R2) asks to
+ * suspend back to the launcher. Safe to overwrite. */
+void gow3_gpu_set_suspend_handler(void (*handler)(void));
+
+/* Live settings updates applied from the launcher while a session is active or suspended. */
+void gow3_gpu_set_fps_limit(int limit);
+void gow3_gpu_set_m1_profile(int profile);
 
 #ifdef __cplusplus
 }

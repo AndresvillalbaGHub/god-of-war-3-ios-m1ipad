@@ -73,12 +73,12 @@ static uint16_t touch_axis(float v, int max) {
 
 /* A click without a touch surface (Back/View, Tab, Backspace, the pad file) is played like a
  * finger: the touch is reported CLICK_LEAD_US before the button, the button stays at least
- * CLICK_HOLD_US, and the touch lingers CLICK_TAIL_US after the release. God of War III opens
- * photo mode on the release of a left click with the finger still down, and ignores a touch
- * that comes and goes with the button. The side is chosen when the click starts and kept: the
- * right source with L1 held is a left click (photo mode on pads without a touchpad). */
-enum { CLICK_LEAD_US=50000, CLICK_HOLD_US=50000, CLICK_TAIL_US=100000 };
-static struct { int side; uint64_t pressed, released; } click={-1,0,0};
+ * CLICK_HOLD_US, and the touch lingers CLICK_TAIL_US after the release, with each phase held for at
+ * least CLICK_MIN_POLLS scePadReadState calls so fast taps never skip a phase at 15-20 FPS.
+ * God of War III opens photo mode on the release of a left click with the finger still down, and
+ * opens the Pause/Checkpoint menu on a right click (Select). */
+enum { CLICK_LEAD_US=50000, CLICK_HOLD_US=50000, CLICK_TAIL_US=100000, CLICK_MIN_POLLS=2 };
+static struct { int side, phase, polls, released; uint64_t phase_start; } click={-1,0,0,0,0};
 static void play_click(PadData *d) {
     const uint64_t now=d->timestamp;
     uint32_t sources=d->buttons & (CLICK_LEFT|CLICK_RIGHT);
@@ -88,19 +88,31 @@ static void play_click(PadData *d) {
         sources|=CLICK_LEFT;
     }
     const int side=(sources & CLICK_LEFT) ? 0 : (sources & CLICK_RIGHT) ? !(d->buttons & BTN_L1) : -1;
-    if (side>=0 && (click.side<0 || click.released)) { click.side=side; click.pressed=now; click.released=0; }
-    else if (side<0 && click.side>=0 && !click.released) click.released=now;
-    if (click.side<0) return;
-    const uint64_t down=click.pressed+CLICK_LEAD_US;
-    uint64_t up=down+CLICK_HOLD_US;
-    if (!click.released) up=UINT64_MAX;
-    else if (click.released>up) up=click.released;
-    if (now>=up && now-up>=CLICK_TAIL_US) { click.side=-1; return; }
+    if (side>=0 && (click.phase==0 || click.phase==3)) {
+        click.side=side; click.phase=1; click.polls=0; click.released=0; click.phase_start=now;
+    } else if (side<0 && click.phase>0 && click.phase<3) {
+        click.released=1;
+    }
+    if (click.phase==0) return;
     if (d->touch_count<2) {
         d->touches[d->touch_count]=(PadTouch){.x=click.side ? 1440 : 480,.y=471,.id=d->touch_count};
         ++d->touch_count;
     }
-    if (now>=down && now<up) d->buttons|=BTN_TOUCHPAD;
+    ++click.polls;
+    if (click.phase==1) {
+        if (click.polls>=CLICK_MIN_POLLS && now-click.phase_start>=CLICK_LEAD_US) {
+            click.phase=2; click.polls=0; click.phase_start=now;
+        }
+    } else if (click.phase==2) {
+        d->buttons|=BTN_TOUCHPAD;
+        if (click.released && click.polls>=CLICK_MIN_POLLS && now-click.phase_start>=CLICK_HOLD_US) {
+            click.phase=3; click.polls=0; click.phase_start=now;
+        }
+    } else if (click.phase==3) {
+        if (click.polls>=CLICK_MIN_POLLS && now-click.phase_start>=CLICK_TAIL_US) {
+            click.side=-1; click.phase=0; click.polls=0; click.released=0;
+        }
+    }
 }
 
 /* Opens the first gamepad SDL knows about; called under lock. */
@@ -208,10 +220,15 @@ static void load_button_maps(void) {
 }
 
 /* On-screen controls (iOS, Gow3TouchControls.swift): written by the UI thread, read here. */
-static uint32_t touch_buttons, touch_sticks=0x80808080u;
+static uint32_t touch_buttons, touch_latched, touch_sticks=0x80808080u;
 void gow3_touch_pad(uint32_t buttons, uint32_t sticks) {
-    __atomic_store_n(&touch_buttons,buttons,__ATOMIC_RELAXED);
+    const uint32_t prev=__atomic_exchange_n(&touch_buttons,buttons,__ATOMIC_RELAXED);
+    const uint32_t newly_pressed=buttons & ~prev;
+    if (newly_pressed) __atomic_fetch_or(&touch_latched,newly_pressed,__ATOMIC_RELAXED);
     __atomic_store_n(&touch_sticks,sticks,__ATOMIC_RELAXED);
+}
+void gow3_pad_trigger_select(void) {
+    __atomic_fetch_or(&touch_latched,CLICK_RIGHT,__ATOMIC_RELAXED);
 }
 /* For the window code (gpu/ios/window_ios.mm): the save list and the settings menu take gamepad
  * events, not the sampled state, so the on-screen buttons are replayed to them as events. */
@@ -226,7 +243,10 @@ static void sample_host(PadData *d) {
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
-    if (gow3gpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    if (gow3gpu_overlay_captures_input()) {
+        __atomic_store_n(&touch_latched,0,__ATOMIC_RELAXED);
+        return; /* settings menu open: neutral input */
+    }
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     load_button_maps();
     if (g) {
@@ -255,7 +275,8 @@ static void sample_host(PadData *d) {
     /* The on-screen controls add to the pad like the keyboard: a stick follows the touch while it
      * is off center. */
     /* 0x20000000 is the on-screen Menu button: for the settings menu only, never the game. */
-    const uint32_t touched=__atomic_load_n(&touch_buttons,__ATOMIC_RELAXED) & ~0x20000000u;
+    const uint32_t latched=__atomic_exchange_n(&touch_latched,0,__ATOMIC_RELAXED) & ~0x20000000u;
+    const uint32_t touched=(__atomic_load_n(&touch_buttons,__ATOMIC_RELAXED) & ~0x20000000u) | latched;
     const uint32_t sticks=__atomic_load_n(&touch_sticks,__ATOMIC_RELAXED);
     d->buttons|=touched;
     if (touched & BTN_L2) d->l2=255;
@@ -393,7 +414,11 @@ static void replay_sample(PadData *d) {
 static int hold_after_capture;
 static void sample(PadData *d) {
     sample_host(d);
-    if (gow3gpu_overlay_captures_input()) { hold_after_capture=1; click.side=-1; return; }
+    if (gow3gpu_overlay_captures_input()) {
+        hold_after_capture=1;
+        click.side=-1; click.phase=0; click.polls=0; click.released=0;
+        return;
+    }
     record_sample(d); /* the click sources as they are: a replay plays them again */
     read_inject();
     replay_sample(d);

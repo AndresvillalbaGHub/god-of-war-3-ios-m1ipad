@@ -26,7 +26,8 @@ Pod::Spec.new do |s|
   # pictures); SDL3 the rest (audio, gamepads, haptics, sensors, its unused UIKit video driver).
   s.frameworks = 'Security', 'Metal', 'QuartzCore', 'IOSurface', 'CoreGraphics', 'ImageIO',
                  'AVFoundation', 'AudioToolbox', 'CoreAudio', 'CoreBluetooth', 'CoreHaptics',
-                 'CoreMotion', 'GameController', 'UIKit', 'Foundation', 'UniformTypeIdentifiers'
+                 'CoreMotion', 'GameController', 'UIKit', 'Foundation', 'UniformTypeIdentifiers',
+                 'Compression'
   # StikJIT's universal script (MPL-2.0), sent to StikDebug when enabling JIT, and the licences of
   # StikJIT and idevice (MIT), which the JIT helper and the pairing library contain.
   s.resource_bundles = { 'Gow3Core' => ['jit/universal.js', 'jit/LICENSE-StikJIT-MPL-2.0.txt', 'jit/LICENSE-idevice-MIT.txt'] }

@@ -470,11 +470,6 @@ void PerformanceTab() {
         static constexpr int m1_values[] = {0, 1, 2, 3};
         ChoiceRow("M1 TBDR profile", s.m1_profile, m1_labels, m1_values, 4,
                   "Trims secondary passes on Apple Silicon (shadows, god-rays, bloom, motion blur, reflections). Live.");
-        static const char* const scale_labels[] = {
-            "Off (Native 540p)", "450p (83%)", "432p (80%)", "360p (67%)"};
-        static constexpr int scale_values[] = {0, 1, 2, 3};
-        ChoiceRow("M1 scene scale", s.m1_scene_scale, scale_labels, scale_values, 4,
-                  "Renders 3D scene passes at lower resolution with linear resolve while keeping auto-exposure and UI/HUD native. Live.");
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Applied on restart");

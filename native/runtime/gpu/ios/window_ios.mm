@@ -1,9 +1,11 @@
 // gow3 (iOS): the game window is the app's CAMetalLayer (Gow3GameView.swift), handed over with
 // gow3_gpu_set_surface. It replaces shim/window.cpp: there is no SDL video on iOS, because UIKit
 // belongs to the React Native shell. The swapchain is a VK_EXT_metal_surface on that layer.
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <dispatch/dispatch.h>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -19,7 +21,14 @@ std::mutex g_surface_mutex;
 std::condition_variable g_surface_cv;
 CAMetalLayer* g_layer; // strong (ARC)
 u32 g_width, g_height, g_refresh_hz = 60;
+std::atomic<void (*)(void)> g_suspend_handler{nullptr};
+bool g_l3_down = false;
+bool g_r2_down = false;
 } // namespace
+
+extern "C" void gow3_gpu_set_suspend_handler(void (*handler)(void)) {
+    g_suspend_handler.store(handler, std::memory_order_release);
+}
 
 // runtime_pad.c: the on-screen controls' buttons (libScePad bits).
 extern "C" uint32_t gow3_touch_buttons(void);
@@ -160,13 +169,43 @@ bool WindowSDL::PollEvents() {
     }
     // Gamepads (runtime_pad.c) are SDL's, updated by its event pump as on the PC window thread;
     // the in-game menu (R3+L2) takes their events first. SDL video is never initialized here.
+    // L3+R2 triggers suspend back to the iOS launcher cleanly.
+    const bool suspended = gow3_is_suspended() != 0;
     if (SDL_WasInit(SDL_INIT_GAMEPAD)) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            Gow3Overlay::HandleEvent(event);
+            if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+                if (event.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK) {
+                    const bool down = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                    if (down && !g_l3_down && g_r2_down && !suspended) {
+                        if (auto cb = g_suspend_handler.load(std::memory_order_acquire)) {
+                            dispatch_async(dispatch_get_main_queue(), ^{ cb(); });
+                        }
+                    }
+                    g_l3_down = down;
+                }
+            } else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+                if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+                    const bool down = event.gaxis.value > 16000;
+                    if (down && !g_r2_down && g_l3_down && !suspended) {
+                        if (auto cb = g_suspend_handler.load(std::memory_order_acquire)) {
+                            dispatch_async(dispatch_get_main_queue(), ^{ cb(); });
+                        }
+                    }
+                    g_r2_down = down;
+                }
+            } else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+                g_l3_down = false;
+                g_r2_down = false;
+            }
+            if (!suspended) {
+                Gow3Overlay::HandleEvent(event);
+            }
         }
     }
-    ReplayTouchButtons();
+    if (!suspended) {
+        ReplayTouchButtons();
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(8));
     return is_open;
 }

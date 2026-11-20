@@ -16,10 +16,14 @@ private enum Pad {
   static let up: UInt32 = 0x10, right: UInt32 = 0x20, down: UInt32 = 0x40, left: UInt32 = 0x80
   static let l2: UInt32 = 0x100, r2: UInt32 = 0x200, l1: UInt32 = 0x400, r1: UInt32 = 0x800
   static let triangle: UInt32 = 0x1000, circle: UInt32 = 0x2000, cross: UInt32 = 0x4000, square: UInt32 = 0x8000
-  /// A click on the right side of the touchpad (the pad code plays it as a touch and a click).
-  static let touchpad: UInt32 = 0x8000_0000
+  /// Click on the left side of the touchpad (photo mode).
+  static let touchpad: UInt32 = 0x4000_0000
+  /// Click on the right side of the touchpad (Select / Back / Pause & Checkpoint menu).
+  static let select: UInt32 = 0x8000_0000
   /// Not a PS4 button: opens or closes the settings and cheats menu (window_ios.mm).
   static let menu: UInt32 = 0x2000_0000
+  /// Host-only button bit: suspends back to the launcher (never forwarded to runtime_pad.c).
+  static let suspendAction: UInt32 = 0x1000_0000
   static let centered: UInt32 = 0x8080_8080
 }
 
@@ -144,16 +148,19 @@ final class Gow3TouchControlsView: UIView {
   private let r1 = PadButton("R1", Pad.r1, size: 16), r2 = PadButton("R2", Pad.r2, size: 16)
   private let l3 = PadButton("L3", Pad.l3, size: 13), r3 = PadButton("R3", Pad.r3, size: 13)
   private let options = PadButton("Options", Pad.options, size: 13)
-  private let touchpad = PadButton("Touchpad", Pad.touchpad, size: 13)
+  private let selectBtn = PadButton("Select", Pad.select, color: UIColor(red: 0.72, green: 0.86, blue: 1.0, alpha: 1), size: 13)
+  private let touchpad = PadButton("Touchpad", Pad.touchpad, size: 12)
   private let menu = PadButton("Menu", Pad.menu, color: UIColor(red: 0.89, green: 0.69, blue: 0.29, alpha: 1), size: 13)
-  private lazy var buttons = [cross, circle, square, triangle, up, down, left, right, l1, l2, r1, r2, l3, r3, options, touchpad, menu]
+  private let suspendBtn = PadButton("Suspend", Pad.suspendAction, color: UIColor(red: 1.0, green: 0.56, blue: 0.48, alpha: 1), size: 12)
+  private lazy var buttons = [cross, circle, square, triangle, up, down, left, right, l1, l2, r1, r2, l3, r3, options, selectBtn, touchpad, menu, suspendBtn]
   private let toggle = UIButton(type: .system)
   private let reset = UIButton(type: .system), smaller = UIButton(type: .system), larger = UIButton(type: .system)
   /// The controls that move and resize together, by the name their layout is saved under.
   private lazy var groups: [(String, [UIView])] = [
     ("leftStick", [leftStick]), ("rightStick", [rightStick]), ("face", [cross, circle, square, triangle]),
     ("dpad", [up, down, left, right]), ("l1", [l1]), ("l2", [l2]), ("r1", [r1]), ("r2", [r2]),
-    ("l3", [l3]), ("r3", [r3]), ("options", [options]), ("touchpad", [touchpad]), ("menu", [menu]),
+    ("l3", [l3]), ("r3", [r3]), ("options", [options]), ("select", [selectBtn]), ("touchpad", [touchpad]),
+    ("menu", [menu]), ("suspend", [suspendBtn]),
   ]
   private var layout = Gow3TouchControls.layout
   private var editing = false
@@ -161,6 +168,7 @@ final class Gow3TouchControlsView: UIView {
   private var drag: (touch: ObjectIdentifier, start: CGPoint, offset: [Double])?
   private var owners: [ObjectIdentifier: Owner] = [:]
   private var sent: (UInt32, UInt32) = (0, Pad.centered)
+  var onSuspendRequest: (() -> Void)?
 
   /// Whether the controls show (the toggle button always does).
   var shown = true {
@@ -293,11 +301,13 @@ final class Gow3TouchControlsView: UIView {
     r2.frame = CGRect(origin: CGPoint(x: w - r - 8 * s - shoulder.width, y: t), size: shoulder)
     r1.frame = CGRect(origin: CGPoint(x: w - r - 8 * s - shoulder.width, y: t + 50 * s), size: shoulder)
 
-    let pill = CGSize(width: 84 * s, height: 32 * s)
-    touchpad.frame = CGRect(origin: CGPoint(x: w / 2 - 40 * s - pill.width, y: t), size: pill)
-    options.frame = CGRect(origin: CGPoint(x: w / 2 + 40 * s, y: t), size: pill)
-    menu.frame = CGRect(origin: CGPoint(x: options.frame.maxX + 12 * s, y: t), size: CGSize(width: 64 * s, height: 32 * s))
-    toggle.frame = CGRect(x: w / 2 - 28 * s, y: t, width: 56 * s, height: 32 * s)
+    toggle.frame = CGRect(x: w / 2 - 26 * s, y: t, width: 52 * s, height: 32 * s)
+    let gapTop = 6 * s
+    touchpad.frame = CGRect(x: toggle.frame.minX - gapTop - 72 * s, y: t, width: 72 * s, height: 32 * s)
+    suspendBtn.frame = CGRect(x: touchpad.frame.minX - gapTop - 66 * s, y: t, width: 66 * s, height: 32 * s)
+    selectBtn.frame = CGRect(x: toggle.frame.maxX + gapTop, y: t, width: 60 * s, height: 32 * s)
+    options.frame = CGRect(x: selectBtn.frame.maxX + gapTop, y: t, width: 64 * s, height: 32 * s)
+    menu.frame = CGRect(x: options.frame.maxX + gapTop, y: t, width: 54 * s, height: 32 * s)
     let tool = CGSize(width: 56 * s, height: 32 * s)
     smaller.frame = CGRect(origin: CGPoint(x: w / 2 - 28 * s - 8 - tool.width, y: t + 40 * s), size: tool)
     larger.frame = CGRect(origin: CGPoint(x: w / 2 + 28 * s + 8, y: t + 40 * s), size: tool)
@@ -394,16 +404,39 @@ final class Gow3TouchControlsView: UIView {
   }
 
   override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-    if let drag, touches.contains(where: { ObjectIdentifier($0) == drag.touch }) { self.drag = nil }
-    if editing { return }
-    for touch in touches {
-      if case .stick(let stick) = owners.removeValue(forKey: ObjectIdentifier(touch)) { stick.release() }
-    }
-    publish()
+    finishTouches(touches, triggerActions: true)
   }
 
   override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-    touchesEnded(touches, with: event)
+    finishTouches(touches, triggerActions: false)
+  }
+
+  private func finishTouches(_ touches: Set<UITouch>, triggerActions: Bool) {
+    if let drag, touches.contains(where: { ObjectIdentifier($0) == drag.touch }) { self.drag = nil }
+    if editing { return }
+    var triggerSuspend = false
+    for touch in touches {
+      switch owners.removeValue(forKey: ObjectIdentifier(touch)) {
+      case .stick(let stick):
+        stick.release()
+      case .button(let button?) where triggerActions && button === suspendBtn:
+        triggerSuspend = true
+      default:
+        break
+      }
+    }
+    publish()
+    if triggerSuspend {
+      onSuspendRequest?()
+    }
+  }
+
+  func releaseAllInputs() {
+    releaseAll()
+  }
+
+  func refreshVisibility() {
+    shown = Gow3TouchControls.enabled && GCController.controllers().isEmpty
   }
 
   private func releaseAll() {
@@ -414,9 +447,10 @@ final class Gow3TouchControlsView: UIView {
   }
 
   private func publish() {
-    var bits: UInt32 = 0
-    for case .button(let button?) in owners.values { bits |= button.bits }
-    for button in buttons { button.pressed = bits & button.bits != 0 }
+    var visualBits: UInt32 = 0
+    for case .button(let button?) in owners.values { visualBits |= button.bits }
+    for button in buttons { button.pressed = visualBits & button.bits != 0 }
+    let bits = visualBits & ~Pad.suspendAction
     let (lx, ly) = leftStick.bytes, (rx, ry) = rightStick.bytes
     let sticks = lx | ly << 8 | rx << 16 | ry << 24
     if sent != (bits, sticks) {

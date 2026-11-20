@@ -1,6 +1,24 @@
 import { NativeModule, requireNativeModule } from 'expo';
 
-declare class Gow3CoreModule extends NativeModule<{}> {
+export type SaveBackupInfo = {
+  name: string;
+  createdAt: number;
+  fileCount: number;
+  totalBytes: number;
+};
+
+export type SaveSummary = {
+  hasSaves: boolean;
+  fileCount: number;
+  totalBytes: number;
+  backups: SaveBackupInfo[];
+};
+
+export type Gow3CoreEvents = {
+  onSessionStateChanged: (event: { started: boolean; suspended: boolean }) => void;
+};
+
+declare class Gow3CoreModule extends NativeModule<Gow3CoreEvents> {
   /** JSON: model, RAM, task address map, footprint and limit, signing flags, JIT pool state. */
   deviceReport(): string;
   /** A debugger (StikDebug) is attached right now. */
@@ -24,17 +42,31 @@ declare class Gow3CoreModule extends NativeModule<{}> {
   /** The app's helper attaches the debugger, then the JIT pool is created and it detaches. Resolves 0 on success. */
   enableJitBuiltIn(poolMb: number): Promise<number>;
   /** Documents/gow3: which of the loader's files are there (from the PC's gow3 out/ folder, and game/). */
-  gameFiles(): { folder: string; boot: boolean; content: boolean; patches: boolean; eboot: boolean; sfo: boolean; started: boolean; cover?: string };
+  gameFiles(): { folder: string; boot: boolean; content: boolean; patches: boolean; eboot: boolean; sfo: boolean; started: boolean; suspended?: boolean; cover?: string };
   /** Runs the game CPU-only through FEXCore (stops at the first GPU call); output goes to Documents/gow3/loader.log. */
   startGameCpuOnly(): Promise<string>;
-  /** Runs the game with graphics in a fullscreen Metal view (two-finger double tap hides it). */
+  /** Runs the game with graphics in a fullscreen Metal view (two-finger double tap, Suspend button, or L3+R2 suspends back). */
   startGame(): Promise<string>;
-  /** Frame cap in gow3.ini (30, 60, or 0 for none), read when the game starts. */
+  /** Re-presents the suspended game session and resumes GPU/audio without restarting or re-enabling JIT. */
+  resumeGame(): Promise<string>;
+  /** Cleanly suspends the active game session back to the launcher. */
+  suspendGame(): Promise<string>;
+  /** Frame cap in gow3.ini (20, 24, 30, 40, 60, or 0 for none), applied live when started. */
   fpsLimit(): number;
   setFpsLimit(limit: number): void;
+  /** M1 TBDR profile in gow3.ini (0=Off, 1=Balanced, 2=Performance, 3=Ultra), applied live when started. */
+  m1Profile(): number;
+  setM1Profile(profile: number): void;
   /** On-screen controls at game start (they hide while a controller is connected; a button in game toggles them). */
   touchControlsEnabled(): boolean;
   setTouchControlsEnabled(enabled: boolean): void;
+  /** Summary of Documents/gow3/user/savedata and local backups. */
+  saveSummary(): SaveSummary;
+  createSaveBackup(name: string): Promise<SaveBackupInfo>;
+  restoreSaveBackup(name: string): Promise<string>;
+  deleteSaveBackup(name: string): Promise<string>;
+  exportSaves(): Promise<string>;
+  importSaves(): Promise<string>;
   /** The last 24 KiB of the loader log. */
   readGameLog(): string;
   clearGameLog(): void;

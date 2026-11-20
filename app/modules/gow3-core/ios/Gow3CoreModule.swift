@@ -24,6 +24,18 @@ private func gow3_gpu_screen_test(_ layer: UnsafeMutableRawPointer?, _ width: UI
                                   _ out: UnsafeMutablePointer<CChar>?, _ capacity: Int) -> Int
 @_silgen_name("gow3_gpu_set_surface")
 func gow3_gpu_set_surface(_ layer: UnsafeMutableRawPointer?, _ width: UInt32, _ height: UInt32, _ refreshHz: UInt32)
+@_silgen_name("gow3_set_suspended")
+private func gow3_set_suspended(_ suspended: Int32)
+@_silgen_name("gow3_is_suspended")
+private func gow3_is_suspended() -> Int32
+@_silgen_name("gow3_pad_trigger_select")
+private func gow3_pad_trigger_select()
+@_silgen_name("gow3_gpu_set_suspend_handler")
+private func gow3_gpu_set_suspend_handler(_ handler: (@convention(c) () -> Void)?)
+@_silgen_name("gow3_gpu_set_fps_limit")
+private func gow3_gpu_set_fps_limit(_ limit: Int32)
+@_silgen_name("gow3_gpu_set_m1_profile")
+private func gow3_gpu_set_m1_profile(_ profile: Int32)
 @_silgen_name("gow3_selftest")
 private func gow3_selftest(_ logPath: UnsafePointer<CChar>?, _ out: UnsafeMutablePointer<CChar>?, _ capacity: Int) -> Int
 
@@ -99,6 +111,96 @@ public class Gow3CoreModule: Module {
   private static var gameLogURL: URL { gameRoot.appendingPathComponent("loader.log") }
 
   private static var gameStarted = false
+  private static var lifecycleObservers: [NSObjectProtocol] = []
+  private static var autoSuspendedByBackground = false
+  private static var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+  private var sessionObserver: NSObjectProtocol?
+
+  private static func iniURL() -> URL {
+    gameRoot.appendingPathComponent("user/gow3.ini")
+  }
+
+  private static func readIniValue(_ key: String) -> String? {
+    let text = (try? String(contentsOf: iniURL(), encoding: .utf8)) ?? ""
+    let prefix = "\(key)="
+    for line in text.split(separator: "\n") where line.hasPrefix(prefix) {
+      return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return nil
+  }
+
+  private static func writeIniInt(_ key: String, _ value: Int) {
+    let ini = iniURL()
+    let prefix = "\(key)="
+    var lines = ((try? String(contentsOf: ini, encoding: .utf8)) ?? "")
+      .split(separator: "\n", omittingEmptySubsequences: false)
+      .map(String.init)
+    if let at = lines.firstIndex(where: { $0.hasPrefix(prefix) }) {
+      lines[at] = "\(key)=\(value)"
+    } else {
+      if lines.last == "" { lines.removeLast() }
+      lines.append("\(key)=\(value)")
+      lines.append("")
+    }
+    try? FileManager.default.createDirectory(at: ini.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? lines.joined(separator: "\n").write(to: ini, atomically: true, encoding: .utf8)
+  }
+
+  private static func installLifecycleObservers() {
+    guard lifecycleObservers.isEmpty else { return }
+    let center = NotificationCenter.default
+    lifecycleObservers.append(
+      center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { _ in
+        guard Gow3CoreModule.gameStarted, gow3_is_suspended() == 0 else { return }
+        Gow3CoreModule.autoSuspendedByBackground = true
+        if Gow3GameViewController.shared?.presentingViewController != nil {
+          gow3_pad_trigger_select()
+        }
+        gow3_set_suspended(1)
+        NotificationCenter.default.post(name: .gow3SessionStateChanged, object: nil)
+      }
+    )
+    lifecycleObservers.append(
+      center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
+        guard Gow3CoreModule.gameStarted else { return }
+        if gow3_is_suspended() == 0 {
+          Gow3CoreModule.autoSuspendedByBackground = true
+          gow3_set_suspended(1)
+        }
+        if Gow3CoreModule.backgroundTask != .invalid {
+          UIApplication.shared.endBackgroundTask(Gow3CoreModule.backgroundTask)
+          Gow3CoreModule.backgroundTask = .invalid
+        }
+        let task = UIApplication.shared.beginBackgroundTask(withName: "gow3-gpu-drain") {
+          let stale = Gow3CoreModule.backgroundTask
+          Gow3CoreModule.backgroundTask = .invalid
+          if stale != .invalid { UIApplication.shared.endBackgroundTask(stale) }
+        }
+        Gow3CoreModule.backgroundTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+          guard Gow3CoreModule.backgroundTask == task, task != .invalid else { return }
+          Gow3CoreModule.backgroundTask = .invalid
+          UIApplication.shared.endBackgroundTask(task)
+        }
+      }
+    )
+    lifecycleObservers.append(
+      center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+        if Gow3CoreModule.backgroundTask != .invalid {
+          UIApplication.shared.endBackgroundTask(Gow3CoreModule.backgroundTask)
+          Gow3CoreModule.backgroundTask = .invalid
+        }
+        guard Gow3CoreModule.gameStarted, Gow3CoreModule.autoSuspendedByBackground else { return }
+        Gow3CoreModule.autoSuspendedByBackground = false
+        if let controller = Gow3GameViewController.shared, controller.presentingViewController != nil {
+          controller.refreshTouchControls()
+          controller.publishSurface()
+          gow3_set_suspended(0)
+          NotificationCenter.default.post(name: .gow3SessionStateChanged, object: nil)
+        }
+      }
+    )
+  }
 
   /// JIT and the game files are ready, and the loader has not run yet (it runs once per launch).
   private static func checkCanStart() throws {
@@ -257,6 +359,26 @@ public class Gow3CoreModule: Module {
 
   public func definition() -> ModuleDefinition {
     Name("Gow3Core")
+
+    Events("onSessionStateChanged")
+
+    OnCreate { [weak self] in
+      self?.sessionObserver = NotificationCenter.default.addObserver(
+        forName: .gow3SessionStateChanged, object: nil, queue: .main
+      ) { [weak self] _ in
+        self?.sendEvent("onSessionStateChanged", [
+          "started": Gow3CoreModule.gameStarted,
+          "suspended": Gow3CoreModule.gameStarted && gow3_is_suspended() != 0,
+        ])
+      }
+    }
+
+    OnDestroy { [weak self] in
+      if let observer = self?.sessionObserver {
+        NotificationCenter.default.removeObserver(observer)
+        self?.sessionObserver = nil
+      }
+    }
 
     // The native report plus what the GPU supports: PS4 textures are BC1-BC7, and without BC support
     // they would have to be transcoded (to ASTC) or expanded to RGBA (4-8x the memory).
@@ -424,6 +546,7 @@ public class Gow3CoreModule: Module {
       return ["folder": "Documents/gow3", "boot": exists("boot-linked.bin"), "content": exists("content.bin"),
               "patches": exists("patches.bin"), "eboot": exists("game/eboot.bin"), "sfo": exists("game/sce_sys/param.sfo"),
               "started": Gow3CoreModule.gameStarted,
+              "suspended": Gow3CoreModule.gameStarted && gow3_is_suspended() != 0,
               // The dump's own cover (sce_sys/icon0.png) for the launcher's game tile; empty without one.
               "cover": exists("game/sce_sys/icon0.png") ? root.appendingPathComponent("game/sce_sys/icon0.png").absoluteString : ""]
     }
@@ -437,7 +560,7 @@ public class Gow3CoreModule: Module {
 
     /// Starts the game with the GPU: the fullscreen Metal view is presented over the app, its layer
     /// becomes the game's window (gow3_gpu_set_surface), then the loader starts. A two-finger double
-    /// tap hides the view again (the game keeps running) so the log can be read.
+    /// tap, the Suspend touch button, or L3+R2 suspends back to the launcher while keeping JIT active.
     AsyncFunction("startGame") { (promise: Promise) in
       do {
         try Gow3CoreModule.checkCanStart()
@@ -453,38 +576,82 @@ public class Gow3CoreModule: Module {
         controller.feedsGame = true
         controller.publishSurface()
         controller.addTouchControls()
+        Gow3GameViewController.shared = controller
+        Gow3CoreModule.installLifecycleObservers()
+        gow3_gpu_set_suspend_handler {
+          DispatchQueue.main.async {
+            Gow3GameViewController.shared?.suspendToLauncher(triggerSelect: true)
+          }
+        }
         do {
           try Gow3CoreModule.startLoader(cpuOnly: false)
-          promise.resolve("Game started; two-finger double tap hides the game view.")
+          NotificationCenter.default.post(name: .gow3SessionStateChanged, object: nil)
+          promise.resolve("Game started; Suspend / L3+R2 / two-finger double tap returns to launcher.")
         } catch {
+          Gow3GameViewController.shared = nil
+          gow3_gpu_set_suspend_handler(nil)
           controller.dismiss(animated: false) { promise.reject(error) }
         }
       }
     }.runOnQueue(.main)
 
-    /// The frame cap in Documents/gow3/user/gow3.ini (the in-game menu's setting, read at game start):
-    /// 30 or 60, 0 for none. The iOS default is 30.
-    Function("fpsLimit") { () -> Int in
-      let ini = Gow3CoreModule.gameRoot.appendingPathComponent("user/gow3.ini")
-      let text = (try? String(contentsOf: ini, encoding: .utf8)) ?? ""
-      for line in text.split(separator: "\n") where line.hasPrefix("fps_limit=") {
-        return Int(line.dropFirst("fps_limit=".count).trimmingCharacters(in: .whitespaces)) ?? 30
+    AsyncFunction("resumeGame") { (promise: Promise) in
+      guard Gow3CoreModule.gameStarted, Gow3GameViewController.shared != nil else {
+        promise.reject(Gow3Error(description: "No active game session to resume."))
+        return
       }
-      return 30
+      Gow3GameViewController.resume { ok in
+        if ok {
+          promise.resolve("Resumed game session.")
+        } else {
+          promise.reject(Gow3Error(description: "Could not present the game view."))
+        }
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("suspendGame") { (promise: Promise) in
+      guard Gow3CoreModule.gameStarted, let controller = Gow3GameViewController.shared else {
+        promise.reject(Gow3Error(description: "No active game session to suspend."))
+        return
+      }
+      controller.suspendToLauncher(triggerSelect: true) {
+        promise.resolve("Game suspended; JIT stays ready.")
+      }
+    }.runOnQueue(.main)
+
+    /// The frame cap in Documents/gow3/user/gow3.ini (the in-game menu's setting):
+    /// 20, 24, 30, 40, 60, or 0 for none. The iOS default is 30.
+    Function("fpsLimit") { () -> Int in
+      guard let value = Gow3CoreModule.readIniValue("fps_limit"), let parsed = Int(value) else { return 30 }
+      return parsed
     }
 
     Function("setFpsLimit") { (limit: Int) in
-      let ini = Gow3CoreModule.gameRoot.appendingPathComponent("user/gow3.ini")
-      var lines = ((try? String(contentsOf: ini, encoding: .utf8)) ?? "").split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-      if let at = lines.firstIndex(where: { $0.hasPrefix("fps_limit=") }) {
-        lines[at] = "fps_limit=\(limit)"
-      } else {
-        if lines.last == "" { lines.removeLast() }
-        lines.append("fps_limit=\(limit)")
-        lines.append("")
+      Gow3CoreModule.writeIniInt("fps_limit", limit)
+      if Gow3CoreModule.gameStarted {
+        gow3_gpu_set_fps_limit(Int32(limit))
       }
-      try? FileManager.default.createDirectory(at: ini.deletingLastPathComponent(), withIntermediateDirectories: true)
-      try? lines.joined(separator: "\n").write(to: ini, atomically: true, encoding: .utf8)
+    }
+
+    /// M1 TBDR profile in gow3.ini (0=Off, 1=Balanced, 2=Performance, 3=Ultra). Applied live if started.
+    Function("m1Profile") { () -> Int in
+      guard let raw = Gow3CoreModule.readIniValue("m1_profile")?.lowercased() else { return 1 }
+      switch raw {
+      case "off": return 0
+      case "balanced": return 1
+      case "performance": return 2
+      case "ultra": return 3
+      default:
+        return min(3, max(0, Int(raw) ?? 1))
+      }
+    }
+
+    Function("setM1Profile") { (profile: Int) in
+      let clamped = min(3, max(0, profile))
+      Gow3CoreModule.writeIniInt("m1_profile", clamped)
+      if Gow3CoreModule.gameStarted {
+        gow3_gpu_set_m1_profile(Int32(clamped))
+      }
     }
 
     /// The launcher's switch for the on-screen controls (they also hide while a controller is connected).
@@ -494,7 +661,45 @@ public class Gow3CoreModule: Module {
 
     Function("setTouchControlsEnabled") { (enabled: Bool) in
       Gow3TouchControls.enabled = enabled
+      DispatchQueue.main.async {
+        Gow3GameViewController.shared?.refreshTouchControls()
+      }
     }
+
+    /// Save data summary and local backups in Documents/gow3/user/{savedata,backups}.
+    Function("saveSummary") { () -> [String: Any] in
+      Gow3SaveManager.summary()
+    }
+
+    AsyncFunction("createSaveBackup") { (name: String) -> [String: Any] in
+      try Gow3SaveManager.createBackup(name: name.isEmpty ? nil : name)
+    }
+
+    AsyncFunction("restoreSaveBackup") { (name: String) -> String in
+      try Gow3SaveManager.restoreBackup(name: name, gameStarted: Gow3CoreModule.gameStarted)
+    }
+
+    AsyncFunction("deleteSaveBackup") { (name: String) -> String in
+      try Gow3SaveManager.deleteBackup(name: name)
+    }
+
+    AsyncFunction("exportSaves") { (promise: Promise) in
+      Gow3SaveManager.exportSaves { result in
+        switch result {
+        case .success(let message): promise.resolve(message)
+        case .failure(let error): promise.reject(error)
+        }
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("importSaves") { (promise: Promise) in
+      Gow3SaveManager.importSaves(gameStarted: Gow3CoreModule.gameStarted) { result in
+        switch result {
+        case .success(let message): promise.resolve(message)
+        case .failure(let error): promise.reject(error)
+        }
+      }
+    }.runOnQueue(.main)
 
     /// The last 24 KiB of Documents/gow3/loader.log.
     Function("readGameLog") { () -> String in

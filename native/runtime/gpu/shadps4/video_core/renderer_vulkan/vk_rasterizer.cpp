@@ -1150,24 +1150,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             ResetBindings(false);
             return;
         }
-        // GoW3 3D scene Z-Prepass: depth-only clearing pass at guest scene size (not 2048x2048 shadow map).
-        if (dctx.num_bound_colors == 0 && dctx.has_depth && dctx.depth_clear_enable &&
-            dctx.depth_width >= 800 && dctx.depth_width <= 1920 &&
-            dctx.depth_height >= 450 && dctx.depth_height <= 1080 &&
-            dctx.depth_width != 2048) {
-            m1_observed_base = {dctx.depth_width, dctx.depth_height};
-            if (!m1_scene_ended && scene_targets->Reduced() &&
-                dctx.depth_width == scene_targets->BaseSize().width &&
-                dctx.depth_height == scene_targets->BaseSize().height) {
-                scene_started = true;
-            }
-        }
-        if (dctx.ps_hash32 == 0xd27a6203u || UiComposition::MovieShader(dctx.vs_hash32) ||
-            (scene_started && dctx.cb0_addr != 0 &&
-             FrameCapture::IsDisplayBuffer(dctx.cb0_addr))) {
-            m1_scene_ended = true;
-            scene_started = false;
-        }
         if (m1_profile.TbdrOptEnabled() && dctx.num_bound_colors == 0 && !dctx.has_depth &&
             dctx.ps_hash32 == 0 && !PipelineHasShaderWrites(pipeline)) {
             m1_profile.NoteNoop();
@@ -1176,10 +1158,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             return;
         }
         if (m1_profile.TbdrOptEnabled() && dctx.num_bound_colors == 0 && dctx.has_depth &&
-            dctx.ps_hash32 == 0 && dctx.depth_clear_enable && !PipelineHasShaderWrites(pipeline)) {
+            dctx.ps_hash32 == 0 && dctx.depth_clear_enable && !scene_targets->Reduced() &&
+            !PipelineHasShaderWrites(pipeline)) {
             auto& depth_img = texture_cache.GetImage(db_desc.first);
-            if ((!scene_targets->Reduced() || !scene_targets->Eligible(depth_img)) &&
-                depth_img.info.resources.layers == 1 && depth_img.info.resources.levels == 1) {
+            if (depth_img.info.resources.layers == 1 && depth_img.info.resources.levels == 1) {
                 scheduler.EndRendering();
                 begin_memo.valid = false;
                 texture_cache.UpdateImage(db_desc.first);
@@ -2785,11 +2767,9 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     sig.num_samples = key.num_samples;
     sig.motion = key.motion_vectors;
     sig.scene_started = scene_started;
-    sig.m1_scene_ended = m1_scene_ended;
-    sig.raster_scaling = upscaler->RasterScaling() || (scene_targets->Reduced() && !m1_scene_ended);
+    sig.raster_scaling = upscaler->RasterScaling();
     sig.upscaler_state = upscaler->RedirectState();
     sig.generation = texture_cache.RegistryGeneration();
-    sig.scene_generation = scene_targets->Generation();
     std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(u32));
     sig.depth_valid = regs.depth_buffer.DepthValid();
     sig.stencil_valid = regs.depth_buffer.StencilValid();
@@ -2959,8 +2939,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
     // A proxy attachment cannot represent MSAA or a feedback loop that reads the
     // same image through the guest's native descriptor during this draw.
-    bool reduced = scene_started && (upscaler->RasterScaling() || scene_targets->Reduced()) &&
-                   key.num_samples == 1 && !m1_scene_ended;
+    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;
     // GOW3_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
     const bool debug_pass = scene_debug_frame && scene_started;
@@ -3015,24 +2994,11 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         std::printf("Scene pass: reduced %d %s\n", reduced, why.c_str());
     }
-    push_data.scene_size = reduced ? scene_targets->PackedShaderSceneSize() : 0;
+    push_data.scene_size = reduced ? SceneResolution::Pack(scene_targets->Size()) : 0;
     if (Gow3Stats::enabled) {
         Gow3Stats::reduced_draws.fetch_add(reduced, std::memory_order_relaxed);
         Gow3Stats::scene_draws.fetch_add(scene_started, std::memory_order_relaxed);
     }
-    const auto ds_eff = GetEffectiveDepthStencilState(regs);
-    const u32 vs32 = u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
-    const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
-    const u32 ps32 = ps_stage ? u32(ps_stage->pgm_hash) : 0u;
-    const bool ps_writes_all = ps_stage && !ps_stage->has_discard;
-    const bool depth_always =
-        !ds_eff.depth_test_enable || !regs.depth_control.depth_enable ||
-        regs.depth_control.depth_func == AmdGpu::CompareFunc::Always;
-    const bool base_fs_tri = regs.num_indices == 3 && regs.num_instances.NumInstances() <= 1 &&
-                             depth_always && ps_writes_all;
-    const bool base_fs_quad = regs.num_indices == 4 && regs.num_instances.NumInstances() <= 1 &&
-                              depth_always && ps_writes_all;
-    const bool no_stencil_reject = !ds_eff.stencil_test_enable;
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
@@ -3066,7 +3032,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                   subres_idx < image->backing->subresource_states.size())
                                      ? image->backing->subresource_states[subres_idx].layout
                                      : image->backing->state.layout;
-        was_undefined[cb] = !reduced && (prev_layout == vk::ImageLayout::eUndefined);
+        was_undefined[cb] = (prev_layout == vk::ImageLayout::eUndefined);
 
         if (reduced) {
             // The native image is resolved lazily when a shader/copy actually reads it.
@@ -3103,6 +3069,11 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
 
+        if (reduced) {
+            const auto target = scene_targets->Attachment(image_id, desc.view_info);
+            attachment.image_view = target.view;
+            attachment.image_layout = target.layout;
+        }
         image->usage.render_target = 1u;
         if (cb == 0 && upscaler->Enabled()) {
             color_redirected = upscaler->RedirectColor(image_id, desc.view_info, redirect);
@@ -3118,8 +3089,6 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.color_attachments[cb] = {};
     }
 
-    bool depth_discard = false;
-    bool depth_read_only = false;
     if (auto image_id = db_desc.first; image_id) {
         auto& desc = db_desc.second;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
@@ -3175,9 +3144,6 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                    vk::AccessFlagBits2::eDepthStencilAttachmentRead)
                 : vk::AccessFlagBits2::eDepthStencilAttachmentRead;
         if (!reduced) {
-            if (is_depth_clear && (!has_stencil || is_stencil_clear)) {
-                scene_targets->DiscardProxy(image);
-            }
             needs_barrier |= runtime.Transit(&image, new_layout,
                                              vk::PipelineStageFlagBits2::eEarlyFragmentTests |
                                                  vk::PipelineStageFlagBits2::eLateFragmentTests,
@@ -3209,12 +3175,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
 
         if (reduced) {
-            depth_discard =
-                (is_depth_clear && (!has_stencil || is_stencil_clear)) ||
-                (base_fs_tri && depth_always && regs.depth_control.depth_write_enable &&
-                 !stencil_write && !regs.depth_control.stencil_enable &&
-                 IsFullCoverageViewportScissor(regs, image.info.size.width, image.info.size.height));
-            depth_read_only = !depth_write_layout && !stencil_write_layout;
+            const auto target = scene_targets->Attachment(image_id, desc.view_info);
+            attachment.image_view = target.view;
+            attachment.image_layout = target.layout;
         }
         image.usage.depth_target = true;
         if (upscaler->Enabled()) {
@@ -3308,7 +3271,29 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
     }
 
-    if (m1_profile.TbdrOptEnabled() && !color_redirected && state.num_color_attachments > 0) {
+    if (reduced) {
+        // Half-resolution passes keep the scene's factor (proxy / native = scene / 1920).
+        const auto size = scene_targets->Size();
+        const auto proxy = pass_size.value_or(size);
+        state.width = proxy.width;
+        state.height = proxy.height;
+        target_scale = {float(size.width) / 1920.0f, float(size.height) / 1080.0f};
+    }
+    if (m1_profile.TbdrOptEnabled() && !reduced && !color_redirected &&
+        state.num_color_attachments > 0) {
+        const auto ds_eff = GetEffectiveDepthStencilState(regs);
+        const u32 vs32 = u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+        const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const u32 ps32 = ps_stage ? u32(ps_stage->pgm_hash) : 0u;
+        const bool ps_writes_all = ps_stage && !ps_stage->has_discard;
+        const bool depth_always =
+            !ds_eff.depth_test_enable || !regs.depth_control.depth_enable ||
+            regs.depth_control.depth_func == AmdGpu::CompareFunc::Always;
+        const bool base_fs_tri = regs.num_indices == 3 && regs.num_instances.NumInstances() <= 1 &&
+                                 depth_always && ps_writes_all;
+        const bool base_fs_quad = regs.num_indices == 4 && regs.num_instances.NumInstances() <= 1 &&
+                                  depth_always && ps_writes_all;
+        const bool no_stencil_reject = !ds_eff.stencil_test_enable;
         const bool full_viewport = IsFullCoverageViewportScissor(regs, state.width, state.height);
         const bool full_cov = base_fs_tri && full_viewport;
         const bool is_clear_draw =
@@ -3338,32 +3323,6 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                 m1_profile.NoteDontCareLoad();
             }
         }
-    }
-    if (reduced) {
-        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
-            if (!cb_descs[cb].first) {
-                continue;
-            }
-            const auto target = scene_targets->Attachment(
-                cb_descs[cb].first, cb_descs[cb].second.view_info,
-                state.color_attachments[cb].is_clear != 0);
-            state.color_attachments[cb].image_view = target.view;
-            state.color_attachments[cb].image_layout = target.layout;
-        }
-        if (db_desc.first) {
-            const auto target = scene_targets->Attachment(
-                db_desc.first, db_desc.second.view_info, depth_discard, depth_read_only);
-            state.depth_stencil_attachment.image_view = target.view;
-            state.depth_stencil_attachment.image_layout = target.layout;
-        }
-        // Half-resolution passes keep the scene's factor (proxy / native = scene / base).
-        const auto size = scene_targets->Size();
-        const auto base = scene_targets->BaseSize();
-        const auto proxy = pass_size.value_or(size);
-        state.width = proxy.width;
-        state.height = proxy.height;
-        target_scale = {float(size.width) / float(base.width),
-                        float(size.height) / float(base.height)};
     }
     if (census_on) {
         std::array<const VideoCore::ImageInfo*, AmdGpu::NUM_COLOR_BUFFERS> colors{};
@@ -4064,21 +4023,6 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
 }
 
 void Rasterizer::NoteFrameStart() {
-    scene_started = false;
-    m1_scene_ended = false;
-    if (!upscaler->Active()) {
-        const int scale_mode =
-            Gow3Settings::Get().m1_scene_scale.load(std::memory_order_relaxed);
-        if (m1_observed_base.width >= 640 && m1_observed_base.height >= 360) {
-            scene_targets->SetBaseSize(m1_observed_base);
-            if (scene_targets->SetSize(SceneResolution::ForM1Scale(scale_mode, m1_observed_base))) {
-                begin_memo.valid = false;
-            }
-        } else if (scale_mode == 0 && scene_targets->Reduced()) {
-            scene_targets->SetSize(scene_targets->BaseSize());
-            begin_memo.valid = false;
-        }
-    }
     m1_profile.OnFrameStart(Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed));
     static const bool m1_frame_stats = [] {
         const char* v = std::getenv("GOW3_FRAME_STATS");
@@ -4093,21 +4037,17 @@ void Rasterizer::NoteFrameStart() {
             const u64 uma_hits = Gow3Stats::uma_stream_hits.exchange(0, std::memory_order_relaxed);
             const u64 uma_bytes = Gow3Stats::uma_stream_bytes.exchange(0, std::memory_order_relaxed);
             const u64 copy_breaks = Gow3Stats::copy_pass_breaks.exchange(0, std::memory_order_relaxed);
-            const auto xfer = scene_targets->ConsumeTransferStats();
-            const auto sc = scene_targets->Size();
             if (st.frames > 0) {
                 const double f = double(st.frames);
                 std::printf("M1 TBDR/Profile (%llu frames, lvl %d, tbdr %d): skipped/frame "
                             "shad=%.1f mblur=%.1f bloom=%.1f refl=%.1f god=%.1f noop=%.1f | "
-                            "def_zclear=%.1f dont_care=%.1f | uma_stream=%.1f (%.1f KB) copy_breaks=%.1f | "
-                            "scene=%ux%u (res=%.1f fill=%.1f)\n",
+                            "def_zclear=%.1f dont_care=%.1f | uma_stream=%.1f (%.1f KB) copy_breaks=%.1f\n",
                             static_cast<unsigned long long>(st.frames),
                             Gow3Settings::Get().m1_profile.load(std::memory_order_relaxed),
                             int(m1_profile.TbdrOptEnabled()), st.shadows / f, st.motion_blur / f,
                             st.bloom / f, st.reflections / f, st.godrays / f, st.noop / f,
                             st.deferred_zclears / f, st.dont_care_loads / f, uma_hits / f,
-                            (uma_bytes / f) / 1024.0, copy_breaks / f, sc.width, sc.height,
-                            xfer.resolves / f, xfer.fills / f);
+                            (uma_bytes / f) / 1024.0, copy_breaks / f);
             }
         }
     }

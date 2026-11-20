@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 #include <vector>
 #include <chrono>
 #include <cstdio>
@@ -32,6 +33,7 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 extern "C" unsigned long long gow3_flip_count; // gow3 (iOS): defined in ios/gow3_start.c
+extern "C" int gow3_is_suspended(void);
 #endif
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -640,6 +642,11 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+#ifdef __APPLE__
+    while (gow3_is_suspended()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+#endif
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -732,6 +739,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     bool immediate_flips = frame_limit != 0;
 
     while (!token.stop_requested()) {
+#ifdef __APPLE__
+        if (gow3_is_suspended()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            next_flip = std::chrono::steady_clock::now();
+            continue;
+        }
+#endif
         if (const u32 limit = current_limit(); limit != frame_limit) {
             frame_limit = limit;
             frame_period = limit ? std::chrono::nanoseconds(1000000000 / limit) : std::chrono::nanoseconds(0);
@@ -800,6 +814,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
         while (!token.stop_requested()) {
+#ifdef __APPLE__
+            if (gow3_is_suspended()) {
+                break;
+            }
+#endif
             {
                 std::unique_lock lk{mutex};
                 if (!request_cv.wait_until(lk, tick_deadline,
@@ -813,6 +832,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 std::this_thread::sleep_until(next_flip);
             }
+#ifdef __APPLE__
+            if (gow3_is_suspended()) {
+                break;
+            }
+#endif
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
             if (request) {
