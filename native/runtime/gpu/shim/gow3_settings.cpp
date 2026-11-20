@@ -150,6 +150,12 @@ void Set(Values& v, const std::string& key, const std::string& value) {
                      : value == "performance" ? 2
                      : value == "ultra" ? 3
                      : std::clamp(i, 0, 3);
+    } else if (key == "m1_scene_scale") {
+        v.m1_scene_scale = value == "off" ? 0
+                         : value == "450p" ? 1
+                         : value == "432p" ? 2
+                         : value == "360p" ? 3
+                         : std::clamp(i, 0, 3);
     } else if (key == "output_res") {
         for (int r = 0; r < OutputCount; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
@@ -198,7 +204,7 @@ void Load() {
         {"GOW3_STALE_READBACK", "stale_readback"},     {"GOW3_FSR1", "fsr1"},
         {"GOW3_RCAS", "rcas"},                        {"GOW3_FRAMES_AHEAD", "frames_queued"},
         {"GOW3_ANISOTROPY", "anisotropy"},            {"GOW3_VIBRATION", "vibration"},
-        {"GOW3_M1_PROFILE", "m1_profile"},
+        {"GOW3_M1_PROFILE", "m1_profile"},            {"GOW3_M1_SCENE_SCALE", "m1_scene_scale"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -327,8 +333,9 @@ void Save() {
                  resolution_names[std::clamp(v.render_resolution.load(), 0, int(resolution_names.size()) - 1)].c_str(),
                  v.engine_fps.load(), int(v.deferred_readback.load()), int(v.stale_readback.load()),
                  int(v.restart_unconfirmed.load()));
-    std::fprintf(file, "anisotropy=%d\nvibration=%d\nm1_profile=%d\n", v.anisotropy.load(),
-                 v.vibration.load(), v.m1_profile.load());
+    std::fprintf(file, "anisotropy=%d\nvibration=%d\nm1_profile=%d\nm1_scene_scale=%d\n",
+                 v.anisotropy.load(), v.vibration.load(), v.m1_profile.load(),
+                 v.m1_scene_scale.load());
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

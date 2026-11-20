@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -10,6 +11,7 @@
 #include "video_core/host_shaders/depth_stencil_bits_frag.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "gow3_toggles.h"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -70,17 +72,25 @@ bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
 // 1 for the scene size, 2 for half resolution (the game's post-processing chain), else 0.
 // Half resolution needs a scene size that halves exactly: the proxy keeps the scene's factor,
 // so the shaders' FragCoord conversion (1920 / scene width) stays correct for it.
-static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene) {
-    if (i.size.width == 1920 && i.size.height == 1080) return 1;
-    if (i.size.width == 960 && i.size.height == 540 && scene.width % 2 == 0 &&
-        scene.height % 2 == 0 && !Gow3Toggle::Disabled(Gow3Toggle::SceneHalfRes)) {
+static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size base,
+                       SceneResolution::Size scene) {
+    if (i.size.width == base.width && i.size.height == base.height) return 1;
+    if (base.width % 2 == 0 && base.height % 2 == 0 &&
+        i.size.width == base.width / 2 && i.size.height == base.height / 2 &&
+        scene.width % 2 == 0 && scene.height % 2 == 0 &&
+        !Gow3Toggle::Disabled(Gow3Toggle::SceneHalfRes)) {
         return 2;
     }
     return 0;
 }
 bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     const auto& i = image.info;
-    const u32 div = SizeDivisor(i, size);
+    // Keep swapchain display buffers and auto-exposure R16G16F luminance targets native.
+    if (FrameCapture::IsDisplayBuffer(i.guest_address) ||
+        i.pixel_format == vk::Format::eR16G16Sfloat) {
+        return false;
+    }
+    const u32 div = SizeDivisor(i, base_size, size);
     if (!div || i.size.depth != 1 || i.resources.layers != 1 || i.num_samples != 1 ||
         i.props.is_block || !image.backing || image.backing->num_samples != 1) {
         return false;
@@ -93,13 +103,39 @@ bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     return Blittable(image.backing->image.image_ci.format) || ShaderResampled(image);
 }
 bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
-    return image.info.size.width == 1920 && image.info.size.height == 1080 && Eligible(image);
+    return image.info.size.width == base_size.width &&
+           image.info.size.height == base_size.height && Eligible(image);
 }
 SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32 level) const {
-    const u32 div = std::max(1u, SizeDivisor(image.info, size));
+    const u32 div = std::max(1u, SizeDivisor(image.info, base_size, size));
     return {std::max(1u, size.width / div >> level), std::max(1u, size.height / div >> level)};
 }
+void SceneTargets::SetBaseSize(SceneResolution::Size next_base) {
+    if (next_base == base_size || next_base.width == 0 || next_base.height == 0) return;
+    if (Reduced() || !entries.empty()) {
+        ResolveAll();
+        scheduler.Finish();
+        entries.clear();
+        tracked.clear();
+        ++generation;
+        recent = {};
+    }
+    base_size = next_base;
+    size = next_base;
+}
+u32 SceneTargets::PackedShaderSceneSize() const {
+    if (!Reduced()) return 0;
+    const u32 pw =
+        std::max(1u, u32(std::lround(1920.0 * double(size.width) / double(base_size.width))));
+    const u32 ph =
+        std::max(1u, u32(std::lround(1080.0 * double(size.height) / double(base_size.height))));
+    return SceneResolution::Pack({pw, ph});
+}
 bool SceneTargets::SetSize(SceneResolution::Size next) {
+    if (next.width == 0 || next.height == 0 ||
+        next.width >= base_size.width || next.height >= base_size.height) {
+        next = base_size;
+    }
     if (next == size) return false;
     ResolveAll();
     scheduler.Finish();
@@ -108,8 +144,9 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     ++generation;
     recent = {};
     size = next;
-    std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
-                "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
+    std::printf("Scene resolution: raster %ux%u (base %ux%u), half-res %ux%u, UI native (live)\n",
+                size.width, size.height, base_size.width, base_size.height,
+                size.width / 2, size.height / 2);
     return true;
 }
 void SceneTargets::ResolveAll() {
@@ -133,6 +170,22 @@ void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access
         if (access & writes) entry.state.NativeWrite();
     }
 }
+void SceneTargets::DiscardProxy(VideoCore::Image& image) {
+    if (copying || !image.scene_proxy) return;
+    const u32 levels = std::min(16u, image.info.resources.levels);
+    for (u32 level = 0; level < levels; ++level) {
+        const auto it = entries.find(Key(image.image_uid, level));
+        if (it != entries.end()) {
+            it->second->state.NativeWrite();
+        }
+    }
+}
+SceneTargets::TransferStats SceneTargets::ConsumeTransferStats() {
+    const TransferStats stats{resolve_count, fill_count};
+    resolve_count = 0;
+    fill_count = 0;
+    return stats;
+}
 void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                                vk::PipelineStageFlags2 stages, vk::AccessFlags2 access) {
     scheduler.EndRendering();
@@ -150,6 +203,7 @@ void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLa
 }
 void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
     copying = true;
+    to_native ? ++resolve_count : ++fill_count;
     scheduler.EndRendering();
     const Runtime::TransferMark mark{runtime, to_native ? "scene proxy resolve" : "scene proxy fill",
                                      original};
@@ -208,11 +262,15 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
             .dstSubresource = {aspect, to_native ? e.level : 0u, 0, 1},
             .dstOffsets = std::array{vk::Offset3D{}, to_native ? native : reduced},
         };
-        // Nearest preserves depth/stencil and avoids assuming linear blit support for
-        // integer G-buffer formats. FSR reconstructs color at the HDR scene boundary.
-        scheduler.Record([src,dst,region](vk::CommandBuffer cmd) {
+        const auto filter =
+            (aspect == vk::ImageAspectFlagBits::eColor &&
+             (Features(original.backing->image.image_ci.format) &
+              vk::FormatFeatureFlagBits::eSampledImageFilterLinear))
+                ? vk::Filter::eLinear
+                : vk::Filter::eNearest;
+        scheduler.Record([src, dst, region, filter](vk::CommandBuffer cmd) {
             cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
-                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+                          vk::ImageLayout::eTransferDstOptimal, region, filter);
         });
     }
     if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
@@ -384,13 +442,19 @@ vk::Pipeline SceneTargets::ResamplePipeline(vk::Format format, bool stencil) {
     resample_pipelines.emplace_back(key, std::move(pipeline));
     return result;
 }
-SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
+SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level, bool discard_previous) {
     auto& original = *lookup(id, 0);
     const u64 key = Key(original.image_uid, level);
     // A draw has up to six targets, mostly the same as the previous draw's.
     for (const auto& [recent_key, recent_entry] : recent) {
         if (recent_entry && recent_key == key) {
-            if (!recent_entry->state.valid) Copy(*recent_entry, original, false);
+            if (!recent_entry->state.valid) {
+                if (discard_previous) {
+                    recent_entry->state.CopiedToProxy();
+                } else {
+                    Copy(*recent_entry, original, false);
+                }
+            }
             return *recent_entry;
         }
     }
@@ -411,7 +475,13 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
         tracked.insert(original.image_uid);
     }
     recent[recent_next++ % recent.size()] = {key, entry.get()};
-    if (!entry->state.valid) Copy(*entry, original, false);
+    if (!entry->state.valid) {
+        if (discard_previous) {
+            entry->state.CopiedToProxy();
+        } else {
+            Copy(*entry, original, false);
+        }
+    }
     return *entry;
 }
 vk::ImageView SceneTargets::View(Entry& e, const VideoCore::Image& original,
@@ -430,21 +500,35 @@ vk::ImageView SceneTargets::View(Entry& e, const VideoCore::Image& original,
     return result;
 }
 SceneTargets::Target SceneTargets::Attachment(VideoCore::ImageId id,
-                                               const VideoCore::ImageViewInfo& info) {
+                                               const VideoCore::ImageViewInfo& info,
+                                               bool discard_previous, bool read_only) {
     auto& original = *lookup(id, 0);
-    auto& e = Get(id, info.range.base.level);
+    auto& e = Get(id, info.range.base.level, discard_previous);
     const bool depth = original.info.props.is_depth;
-    const auto layout = depth ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                              : vk::ImageLayout::eColorAttachmentOptimal;
-    // Consecutive draws can stay in the same render pass.
-    if (e.layout != layout) {
-        Transition(e, original.aspect_mask, layout,
-            depth ? vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests
-                  : vk::PipelineStageFlags2(vk::PipelineStageFlagBits2::eColorAttachmentOutput),
-            depth ? vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite
-                  : vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite);
+    if (depth && read_only) {
+        if (e.layout != vk::ImageLayout::eDepthStencilReadOnlyOptimal) {
+            Transition(e, original.aspect_mask, vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                       vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                           vk::PipelineStageFlagBits2::eLateFragmentTests,
+                       vk::AccessFlagBits2::eDepthStencilAttachmentRead);
+        }
+    } else {
+        const auto layout = depth ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                  : vk::ImageLayout::eColorAttachmentOptimal;
+        // Consecutive draws can stay in the same render pass.
+        if (e.layout != layout) {
+            Transition(e, original.aspect_mask, layout,
+                       depth ? vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                   vk::PipelineStageFlagBits2::eLateFragmentTests
+                             : vk::PipelineStageFlags2(
+                                   vk::PipelineStageFlagBits2::eColorAttachmentOutput),
+                       depth ? vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                   vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                             : vk::AccessFlagBits2::eColorAttachmentRead |
+                                   vk::AccessFlagBits2::eColorAttachmentWrite);
+        }
+        e.state.ProxyWrite();
     }
-    e.state.ProxyWrite();
     auto attachment_info = info;
     attachment_info.is_storage = true; // include stencil in attachment views
     return {e.image, View(e, original, attachment_info), e.layout, e.image.image_ci.usage};

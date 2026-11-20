@@ -324,8 +324,11 @@ bool TemporalUpscaler::OnFrameStart() {
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
-        scene_targets.SetSize(SceneResolution::ForPreset(active ? preset : 0,
-                                                        {target_width, target_height}));
+        if (active) {
+            scene_targets.SetSize(SceneResolution::ForPreset(preset, {target_width, target_height}));
+        } else if (Gow3Settings::Get().m1_scene_scale.load(std::memory_order_relaxed) == 0) {
+            scene_targets.SetSize(scene_targets.BaseSize());
+        }
         render_width = scene_targets.Size().width;
         render_height = scene_targets.Size().height;
     }

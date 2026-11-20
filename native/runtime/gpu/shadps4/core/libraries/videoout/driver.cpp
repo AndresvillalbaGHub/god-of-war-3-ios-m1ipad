@@ -703,6 +703,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
                                     : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
+    const auto advance_next_flip = [&](std::chrono::steady_clock::time_point flip_now) {
+        // Drift-free fixed-step advance when hitting the cap; re-anchor from flip_now
+        // when the GPU ran slower than the cap so next_flip never lags a full period behind
+        // (prevents 2-3x GPU queue burst stalls seen at 20/24 FPS caps on iOS).
+        if (flip_now > next_flip + std::chrono::milliseconds(2)) {
+            next_flip = flip_now + frame_period;
+        } else {
+            next_flip += frame_period;
+        }
+    };
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS (immediate flips %s)\n",
                 EmulatorSettings.GetVblankFrequency(), frame_limit,
                 frame_limit != 0 ? "on" : "off");
@@ -745,7 +755,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                advance_next_flip(now);
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -806,7 +816,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
             if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                advance_next_flip(now);
                 Flip(request);
                 FRAME_END;
             }

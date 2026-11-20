@@ -24,12 +24,18 @@ public:
     SceneTargets(const Instance&, Scheduler&, Runtime&, Lookup);
     ~SceneTargets();
     bool SetSize(SceneResolution::Size);
+    void SetBaseSize(SceneResolution::Size next_base);
     SceneResolution::Size Size() const { return size; }
-    bool Reduced() const { return size != SceneResolution::Size{}; }
-    /// A reduced proxy can stand in for the image: a 1920x1080 scene target or, scaled by
-    /// the same factor, a half-resolution (960x540) one (toggle SceneHalfRes).
+    SceneResolution::Size BaseSize() const { return base_size; }
+    bool Reduced() const {
+        return size.width > 0 && size.height > 0 &&
+               size.width < base_size.width && size.height < base_size.height;
+    }
+    u32 PackedShaderSceneSize() const;
+    /// A reduced proxy can stand in for the image: a base-size scene target or, scaled by
+    /// the same factor, a half-resolution one (toggle SceneHalfRes).
     bool Eligible(const VideoCore::Image&) const;
-    /// Eligible at the full scene size (1920x1080): the upscaler's inputs, the scene start.
+    /// Eligible at the full scene size (base_size): the upscaler's inputs, the scene start.
     bool EligibleScene(const VideoCore::Image&) const;
     /// The proxy size of an eligible image: the scene size divided like the native size.
     SceneResolution::Size ProxySize(const VideoCore::Image&, u32 level = 0) const;
@@ -39,11 +45,18 @@ public:
         vk::ImageLayout layout;
         vk::ImageUsageFlags usage;
     };
-    Target Attachment(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
+    Target Attachment(VideoCore::ImageId, const VideoCore::ImageViewInfo&,
+                      bool discard_previous = false, bool read_only = false);
     Target Read(VideoCore::ImageId, const VideoCore::ImageViewInfo&,
                 vk::PipelineStageFlags2 = vk::PipelineStageFlagBits2::eComputeShader,
                 vk::AccessFlags2 = vk::AccessFlagBits2::eShaderRead);
     void NativeAccess(VideoCore::Image&, vk::AccessFlags2);
+    void DiscardProxy(VideoCore::Image&);
+    struct TransferStats {
+        u64 resolves{};
+        u64 fills{};
+    };
+    TransferStats ConsumeTransferStats();
     /// The proxy of `image` for sampling when it holds the current content (else nullopt: the
     /// native image is current). Transitions only after other use (attachment, copy).
     /// Mipmapped targets have one proxy per level: views of one level only.
@@ -78,7 +91,7 @@ private:
     static constexpr u64 Key(u64 uid, u32 level) {
         return uid << 4 | level;
     }
-    Entry& Get(VideoCore::ImageId, u32 level = 0);
+    Entry& Get(VideoCore::ImageId, u32 level = 0, bool discard_previous = false);
     vk::ImageView View(Entry&, const VideoCore::Image&, const VideoCore::ImageViewInfo&);
     void Copy(Entry&, VideoCore::Image&, bool to_native);
     // Depth/stencil formats without blit support (D32S8 on RADV) are resampled by a
@@ -96,12 +109,15 @@ private:
     Scheduler& scheduler;
     Runtime& runtime;
     Lookup lookup;
+    SceneResolution::Size base_size{1920, 1080};
     SceneResolution::Size size;
     std::unordered_map<u64, std::unique_ptr<Entry>> entries; ///< by Key(uid, level)
     std::unordered_set<u64> tracked; ///< uids with proxies
     bool copying = false;
     bool force_stencil_bits = false; ///< test the portable resampler on any driver
     u64 generation = 0;
+    u64 resolve_count = 0;
+    u64 fill_count = 0;
     mutable std::unordered_map<vk::Format, vk::FormatFeatureFlags> format_features;
     mutable std::array<vk::FormatFeatureFlags, 256> format_table{};
     mutable std::array<bool, 256> format_known{};
